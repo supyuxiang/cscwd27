@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+runs/
+outputs/
+data/*
+!data/preprocess.py
+*.pt
+*.log
+.ipynb_checkpoints/
