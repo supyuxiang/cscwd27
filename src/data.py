@@ -1,5 +1,3 @@
-"""JSONL dataset and CLIP batching."""
-
 from __future__ import annotations
 
 import json
