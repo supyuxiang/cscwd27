@@ -1,6 +1,5 @@
-# CMAAN：双阶段跨模态注意力虚假新闻检测
+# CMAAN
 
-复现 Yang, Xu, Lan, Zhu 的 CSCWD 2026 论文 *Dual-Stage Cross-Modal Attention Network for Multimodal Fake News Detection*。模型名称是 **CMAAN**（Cross-Modal Aligned Attention Network）。
 
 ## 代码结构
 
