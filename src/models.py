@@ -46,6 +46,7 @@ class CLIPEncoder(nn.Module):
                 p.requires_grad_(False)
             self.model.eval()
 
+
     def train(self, mode: bool=True):
         super().train(mode)
         if self.freeze:
