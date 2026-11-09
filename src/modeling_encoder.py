@@ -1172,7 +1172,8 @@ class GQA(nn.Module):
         assert q.size(-1) == k.size(-1) == v.size(-1) == self.d_model, (q.size(-1), k.size(-1), v.size(-1))
         assert k.size(1) == v.size(1), (k.size(1), v.size(1))
         bsz, seq_len_q, seq_len_kv = q.size(0), q.size(1), k.size(1)
-        use_flash_ctx = (self.d_k <= 256) # and attn_mask is None
+        # Flash kernels are CUDA-only. On CPU, the default SDPA backend still runs GQA.
+        use_flash_ctx = self.d_k <= 256 and q.is_cuda
         # bsz, seq_len_q, d_model -> bsz, seq_len_q, num_heads_q, d_k -> bsz, num_heads_q, seq_len_q, d_k
         q = self.wq(q).view(bsz, seq_len_q, self.num_heads_q, self.d_k).transpose(1,2)
         # bsz, seq_len_kv, d_model -> bsz, seq_len_kv, num_heads_kv, d_k -> bsz, num_heads_kv, seq_len_kv, d_k
@@ -1269,7 +1270,53 @@ class TransformerEncoderLayer(nn.Module):
 
         return x
 
-        
+
+def _stack_loop_features(outputs) -> torch.Tensor:
+    """Stack per-loop pooled vectors into `[batch, num_loops, embed_dim]`."""
+    if isinstance(outputs, BaseModelOutputWithPooling):
+        features = outputs.pooler_output
+    elif torch.is_tensor(outputs):
+        features = outputs
+    else:
+        pooled = []
+        for item in outputs:
+            if isinstance(item, BaseModelOutputWithPooling):
+                pooled.append(item.pooler_output)
+            elif torch.is_tensor(item):
+                pooled.append(item)
+            else:
+                raise TypeError(
+                    "Loop features must be pooled tensors or BaseModelOutputWithPooling, "
+                    f"got {type(item).__name__}."
+                )
+        if not pooled:
+            raise ValueError("Loop feature list is empty.")
+        return torch.stack(pooled, dim=1)
+
+    if features.dim() == 2:
+        return features.unsqueeze(1)
+    if features.dim() == 3:
+        return features
+    raise ValueError(
+        "Pooled loop features must have shape [batch, dim] or [batch, loops, dim], "
+        f"got {tuple(features.shape)}."
+    )
+
+
+def _encoder_weights(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    """Drop a CLIP tower prefix and skip non-persistent position buffers."""
+    head = prefix + "."
+    weights = {}
+    for key, value in state_dict.items():
+        if not key.startswith(head):
+            continue
+        subkey = key[len(head):]
+        if subkey.endswith("position_ids"):
+            continue
+        weights[subkey] = value
+    if not weights:
+        raise RuntimeError(f"Checkpoint has no weights under {prefix!r}.")
+    return weights
 
 
 class Fuse(nn.Module):
@@ -1320,17 +1367,16 @@ class Fuse(nn.Module):
 
     def forward(
         self,
-        out_ls_t: list[BaseModelOutputWithPooling], # pooler_output: bsz, embed_dim
-        out_ls_v: list[BaseModelOutputWithPooling]
+        out_ls_t: list[BaseModelOutputWithPooling] | list[torch.Tensor] | torch.Tensor,
+        out_ls_v: list[BaseModelOutputWithPooling] | list[torch.Tensor] | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(out_ls_t, BaseModelOutputWithPooling):
-            t = (out_ls_t.pooler_output).unsqueeze(0)
-        else:
-            t = torch.stack(out_ls_t, dim=1) # bsz, num_loops, embed_dim
-        if isinstance(out_ls_v, BaseModelOutputWithPooling):
-            v = (out_ls_v.pooler_output).unsqueeze(0)
-        else:
-            v = torch.stack(out_ls_v, dim=1) # bsz, num_loops, embed_dim
+        # Each entry is one loop's pooled hidden state: text EOS, or vision CLS.
+        t = _stack_loop_features(out_ls_t)  # bsz, num_loops, embed_dim
+        v = _stack_loop_features(out_ls_v)  # bsz, num_loops, embed_dim
+        if t.size(-1) != self.embed_dim or v.size(-1) != self.embed_dim:
+            raise ValueError(
+                f"Fuse expected embed_dim={self.embed_dim}, got text {tuple(t.shape)} and vision {tuple(v.shape)}."
+            )
 
         # t_v
         attn_t_v = self.gqa_t_v(
@@ -1362,53 +1408,96 @@ class FullModel(nn.Module):
         clip_path: str,
         num_heads_q: int,
         num_heads_kv: int,
-        dropout_p: float=0.1
+        dropout_p: float = 0.1,
+        num_classes: int = 2,
     ):
         super().__init__()
-
+        self.num_classes = num_classes
         self._load_looped_models(clip_path)
-        self.embed_dim = self.text_encoder.embed_dim
         self.fuse = Fuse(
             embed_dim=self.embed_dim,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
-            dorpout_p=dropout_p
+            dropout_p=dropout_p,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(self.embed_dim * 2, self.embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(self.embed_dim, num_classes),
         )
 
     def _load_looped_models(self, clip_path: str) -> None:
         from transformers import CLIPModel
+
         official = CLIPModel.from_pretrained(
             clip_path,
-            trust_remote_code=True
+            trust_remote_code=True,
         )
-        sd = official.state_dict()
+        state_dict = official.state_dict()
+        config = official.config
         del official
 
-        config = CLIPConfig.from_pretrained(clip_path)
-        self.text_encoder = LoopedCLIPTextModel(config)
-        self.vision_encoder = LoopedCLIPVisionModel(config)
-    
-        missing_text, unexpected_text = self.text_encoder.load_state_dict(sd, strict=False)
-        missing_vision, unexpected_vision = self.vision_encoder.load_state_dict(sd, strict=False)
+        self.text_encoder = LoopedCLIPTextModel(config.text_config)
+        self.vision_encoder = LoopedCLIPVisionModel(config.vision_config)
+        self.text_encoder.load_state_dict(_encoder_weights(state_dict, "text_model"), strict=True)
+        self.vision_encoder.load_state_dict(_encoder_weights(state_dict, "vision_model"), strict=True)
 
-        # # 如果有新层，手动初始化
-        # for name, param in model.named_parameters():
-        #     if any(k in name for k in ['loop_', 'new_']):  # 你的新层前缀
-        #         if param.dim() >= 2:
-        #             nn.init.xavier_uniform_(param)
+        text_hidden = int(config.text_config.hidden_size)
+        vision_hidden = int(config.vision_config.hidden_size)
+        # Fuse reads one shared width. Keep the text loop hidden states as they are,
+        # and map vision CLS states into that width when the towers differ.
+        self.embed_dim = text_hidden
+        if text_hidden == vision_hidden:
+            self.vision_align = nn.Identity()
+            return
 
-    
+        if "text_projection.weight" not in state_dict or "visual_projection.weight" not in state_dict:
+            raise RuntimeError(
+                "CLIP text and vision hidden sizes differ, but the checkpoint has no "
+                "text_projection/visual_projection weights to initialize the alignment."
+            )
+        self.vision_align = nn.Linear(vision_hidden, text_hidden, bias=False)
+        text_weight = state_dict["text_projection.weight"]
+        vision_weight = state_dict["visual_projection.weight"]
+        # Solve text_projection(align(v)) ~= visual_projection(v).
+        solution = torch.linalg.lstsq(text_weight.float(), vision_weight.float()).solution
+        if tuple(solution.shape) != (text_hidden, vision_hidden):
+            raise RuntimeError(
+                f"Vision alignment init produced shape {tuple(solution.shape)}, "
+                f"expected {(text_hidden, vision_hidden)}."
+            )
+        with torch.no_grad():
+            self.vision_align.weight.copy_(solution.to(dtype=self.vision_align.weight.dtype))
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         pixel_values: torch.FloatTensor,
-        num_loops: int=3
-    ):
-        # input_ids: bsz, seq_len, embed_dim
+        num_loops: int = 3,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # input_ids: bsz, seq_len
         # attention_mask: bsz, seq_len
         # pixel_values: bsz, c, h, w
-        pass
+        if num_loops < 1:
+            raise ValueError(f"num_loops must be positive, got {num_loops}.")
+
+        text_outs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            num_loops=num_loops,
+        )
+        vision_outs = self.vision_encoder(
+            pixel_values=pixel_values,
+            num_loops=num_loops,
+        )
+        text_loops = [out.pooler_output for out in text_outs]
+        vision_loops = [self.vision_align(out.pooler_output) for out in vision_outs]
+        feature_t_v, feature_v_t = self.fuse(text_loops, vision_loops)
+        return self.classifier(torch.cat([feature_t_v, feature_v_t], dim=-1))
 
 
         
@@ -1416,7 +1505,7 @@ class FullModel(nn.Module):
 
 __all__ = [
     'LoopedCLIPTextModel',
-    'LoopedCLIPVisionModel'
+    'LoopedCLIPVisionModel',
     'Fuse',
     'FullModel'
 ]

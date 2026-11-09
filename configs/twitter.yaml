@@ -15,7 +15,7 @@ test_jsonl: /root/autodl-tmp/cscwd27/twitter/test.jsonl
 image_root: /root/autodl-tmp/cscwd27/twitter_raw
 val_ratio: 0.1
 max_text_length: 77
-batch_size: 128
+batch_size: 8
 num_workers: 0
 epochs: 50
 lr: 0.0005
