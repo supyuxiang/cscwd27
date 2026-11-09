@@ -9,3 +9,4 @@ data/*
 *.pt
 *.log
 .ipynb_checkpoints/
+proposal.md
