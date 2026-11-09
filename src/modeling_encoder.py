@@ -1032,7 +1032,7 @@ class LoopedCLIPTextModel(CLIPTextModel):
         position_ids: torch.Tensor | None = None,
         num_loops: int=3,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> list[BaseModelOutputWithPooling]:
         # input_ids: bsz, seq_len
         # attention_mask: bsz, seq_len
         # position_ids: bsz, seq_len
@@ -1052,42 +1052,52 @@ class LoopedCLIPTextModel(CLIPTextModel):
         )
 
         kwargs.pop("is_causal", None)
-        encoder_outputs: BaseModelOutput = self.encoder(
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
-            is_causal=True,
-            **kwargs,
-        )
 
-        last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.final_layer_norm(last_hidden_state)
+        out_ls = []
+        for _ in range(num_loops):
+            
+            encoder_outputs: BaseModelOutput = self.encoder(
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                is_causal=True,
+                **kwargs,
+            )
 
-        if self.eos_token_id == 2:
-            # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
-            # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
-            # ------------------------------------------------------------
-            # text_embeds.shape = [batch_size, sequence_length, transformer.width]
-            # take features from the eot embedding (eot_token is the highest number in each sequence)
-            # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
-            pooled_output = last_hidden_state[
-                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
-            ]
-        else:
-            # The config gets updated `eos_token_id` from PR #24773 (so the use of extra new tokens is possible)
-            pooled_output = last_hidden_state[
-                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
-                # Note: we assume each sequence (along batch dim.) contains an  `eos_token_id` (e.g. prepared by the tokenizer)
-                (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
-                .int()
-                .argmax(dim=-1),
-            ]
+            last_hidden_state = encoder_outputs.last_hidden_state
+            last_hidden_state = self.final_layer_norm(last_hidden_state)
 
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-        )
+            if self.eos_token_id == 2:
+                # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
+                # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
+                # ------------------------------------------------------------
+                # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+                # take features from the eot embedding (eot_token is the highest number in each sequence)
+                # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+                pooled_output = last_hidden_state[
+                    torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                    input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+                ]
+            else:
+                # The config gets updated `eos_token_id` from PR #24773 (so the use of extra new tokens is possible)
+                pooled_output = last_hidden_state[
+                    torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                    # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
+                    # Note: we assume each sequence (along batch dim.) contains an  `eos_token_id` (e.g. prepared by the tokenizer)
+                    (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
+                    .int()
+                    .argmax(dim=-1),
+                ]
+            
+            out_ls.append(
+                BaseModelOutputWithPooling(
+                    last_hidden_state=last_hidden_state,
+                    pooler_output=pooled_output,
+                )
+            )
+
+            hidden_states = last_hidden_state # bsz, seq_len, embed_dim
+
+        return out_ls
 
 
 class LoopedCLIPVisionModel(CLIPVisionModel):
@@ -1103,41 +1113,31 @@ class LoopedCLIPVisionModel(CLIPVisionModel):
         interpolate_pos_encoding: bool | None = False,
         num_loops: int=3,
         **kwargs: Unpack[TransformersKwargs],
-    ):
-        pass
+    ) -> list[BaseModelOutputWithPooling]:
+        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        hidden_states = self.pre_layrnorm(hidden_states)
 
+        out_ls = []
+        for _ in range(num_loops):
+            encoder_outputs: BaseModelOutput = self.encoder(
+                inputs_embeds=hidden_states,
+                **kwargs,
+            )
 
+            last_hidden_state = encoder_outputs.last_hidden_state
+            pooled_output = last_hidden_state[:, 0, :]
+            pooled_output = self.post_layernorm(pooled_output)
 
-class LoopedCLIPModel(nn.Module):
-    def __init__(self, config, num_loops=3):
-        super().__init__()
-        self.num_loops = num_loops
-        self.text_model = LoopedCLIPTextModel(config.text_config)
-        
-        self.vision_model = LoopedCLIPVisionModel(config.vision_config)
-        self.text_projection = nn.Linear(
-            config.text_config.hidden_size, config.projection_dim, bias=False
-        )
-        self.visual_projection = nn.Linear(
-            config.vision_config.hidden_size, config.projection_dim, bias=False
-        )
-        self.logit_scale = nn.Parameter(
-            torch.ones([]) * config.logit_scale_init_value
-        )
+            out_ls.append(
+                BaseModelOutputWithPooling(
+                    last_hidden_state=last_hidden_state,
+                    pooler_output=pooled_output
+                )
+            )
 
-    def forward(self, input_ids=None, pixel_values=None, **kwargs):
-        text_out = self.text_model(
-            input_ids, num_loops=self.num_loops, **kwargs
-        )
-        text_embeds = text_out[:, 0, :]
-        text_embeds = self.text_projection(text_embeds)
-        
-        if pixel_values is not None:
-            vision_out = self.vision_model(pixel_values)[0][:, 0, :]
-            image_embeds = self.visual_projection(vision_out)
-            return text_embeds, image_embeds
-        return text_embeds
-
+            hidden_states = last_hidden_state
+            
+        return out_ls
 
 
 
@@ -1169,6 +1169,5 @@ def load_looped_clip(clip_path, num_loops=3):
 
 __all__ = [
     'LoopedCLIPTextModel',
-    'LoopedCLIPVisionModel',
-    'LoopedCLIPModel'
+    'LoopedCLIPVisionModel'
 ]
