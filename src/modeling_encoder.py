@@ -13,12 +13,14 @@
 # limitations under the License.
 """PyTorch CLIP model."""
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -1165,6 +1167,244 @@ def load_looped_clip(clip_path, num_loops=3):
                 nn.init.xavier_uniform_(param)
     
     return model
+
+
+
+class GQA(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads_q: int,
+        num_heads_kv: int
+    ):
+        super().__init__()
+        assert num_heads_q % num_heads_kv == 0, (num_heads_q, num_heads_kv)
+        assert d_model % num_heads_q == 0, d_model
+
+        self.d_model = d_model
+        self.num_heads_q = num_heads_q
+        self.num_heads_kv = num_heads_kv
+
+        self.d_k = self.d_model // self.num_heads_q
+
+        self.wq = nn.Linear(d_model, self.d_k * self.num_heads_q, bias=False) # d_model = d_k * num_heads_q
+        self.wk = nn.Linear(d_model, self.d_k * self.num_heads_kv, bias=False)
+        self.wv = nn.Linear(d_model, self.d_k * self.num_heads_kv, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=True)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,mask=None) -> torch.Tensor:
+        # x: batch_size, seq_len ,d_model
+        # check
+        assert len(q.shape) == len(k.shape) == len(v.shape) == 3, (q.shape, k.shape, v.shape)
+        assert q.size(-1) == k.size(-1) == v.size(-1) == self.d_model, (q.size(-1), k.size(-1), v.size(-1))
+        assert k.size(1) == v.size(1), (k.size(1), v.size(1))
+        bsz, seq_len_q, seq_len_kv = q.size(0), q.size(1), k.size(1)
+        use_flash_ctx = (self.d_k <= 256) # and attn_mask is None
+        # bsz, seq_len_q, d_model -> bsz, seq_len_q, num_heads_q, d_k -> bsz, num_heads_q, seq_len_q, d_k
+        q = self.wq(q).view(bsz, seq_len_q, self.num_heads_q, self.d_k).transpose(1,2)
+        # bsz, seq_len_kv, d_model -> bsz, seq_len_kv, num_heads_kv, d_k -> bsz, num_heads_kv, seq_len_kv, d_k
+        k = self.wk(k).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1,2)
+        v = self.wv(v).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1,2)
+
+        # scaled_dot_product_attention with flash_attn_v2
+        with (
+            torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION])
+            if use_flash_ctx else contextlib.nullcontext()
+        ):
+            attn_out = F.scaled_dot_product_attention(
+                q,k,v,attn_mask=mask, dropout_p=0.0, is_causal=False, enable_gqa=True
+            ) # bsz, num_heads_q, seq_len_q, d_k
+        # bsz, seq_len_q, num_heads_q, d_k -> bsz, seq_len_q, d_model
+        attn_out = attn_out.transpose(1,2).contiguous().view(bsz, seq_len_q, -1)
+        out = self.wo(attn_out)
+        return out
+    
+
+class FFN(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ffn: int,
+        dropout_p: float=0.1
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ffn = d_ffn
+        self.dropout_p = dropout_p
+
+        self.fc1 = nn.Linear(d_model, d_ffn)
+        self.activation = nn.ReLU()
+        self.fc2 = nn.Linear(d_ffn, d_model)
+        self.dropout = nn.Dropout(dropout_p)
+    
+    def forward(self, x: torch.Tensor):
+        return self.dropout(self.fc2(self.activation(self.fc1(x))))
+        
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads_q: int,
+        num_heads_kv: int,
+        d_ffn: int,
+        dropout_p: float=0.1,
+    ):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.num_heads_q = num_heads_q
+        self.num_heads_kv = num_heads_kv
+        self.d_ffn = d_ffn
+        self.dropout_p = dropout_p
+
+        self.gqa = GQA(
+            d_model=d_model,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv
+        )
+
+        self.ffn = FFN(
+            d_model=d_model,
+            d_ffn=d_ffn,
+            dropout_p=dropout_p
+        )
+
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        nn.init.ones_(self.ln1.weight)
+        nn.init.zeros_(self.ln1.bias)
+        nn.init.ones_(self.ln2.weight)
+        nn.init.zeros_(self.ln2.bias)
+
+
+        self.dropout1 = nn.Dropout(dropout_p)
+        self.dropout2 = nn.Dropout(dropout_p)
+
+    def forward(
+        self,x,mask=None
+    ):
+        residual = x
+        x = self.ln1(x)
+        attn_out = self.dropout1(self.gqa(x,x,x,mask=mask))
+        x = residual + attn_out
+
+        residual = x
+        x = self.ln2(x)
+        ffn_out = self.dropout2(self.ffn(x))
+        x = residual + ffn_out
+
+        return x
+
+        
+
+
+class Fuse(nn.Module):
+    def __init__(
+        self,
+        num_loops: int,
+        embed_dim: int,
+        num_heads_q: int,
+        num_heads_kv: int,
+        dropout_p: float=0.1
+    ):
+        super().__init__()
+
+        self.num_loops = num_loops
+        self.embed_dim = embed_dim
+        self.num_heads_q = num_heads_q
+        self.num_heads_kv = num_heads_kv
+
+        self.gqa_t_v = GQA(
+            d_model=embed_dim,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+        )
+
+        self.gqa_v_t = GQA(
+            d_model=embed_dim,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv
+        )
+
+        self.ffn_t_v = FFN(
+            d_model=embed_dim,
+            d_ffn=4*embed_dim,
+            dropout_p=dropout_p
+        )
+
+        self.ffn_v_t = FFN(
+            d_model=embed_dim,
+            d_ffn=4*embed_dim,
+            dropout_p=dropout_p
+        )
+
+        self.ln_t_v = nn.LayerNorm(embed_dim)
+        self.ln_v_t = nn.LayerNorm(embed_dim)
+        nn.init.ones_(self.ln_t_v.weight)
+        nn.init.zeros_(self.ln_t_v.bias)
+        nn.init.ones_(self.ln_v_t.weight)
+        nn.init.zeros_(self.ln_v_t.bias)
+
+
+    def forward(
+        self,
+        out_ls_t: list[BaseModelOutputWithPooling], # pooler_output: bsz, embed_dim
+        out_ls_v: list[BaseModelOutputWithPooling]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(out_ls_t, BaseModelOutputWithPooling):
+            t = (out_ls_t.pooler_output).unsqueeze(0)
+        else:
+            t = torch.stack(out_ls_t, dim=1) # bsz, num_loops, embed_dim
+        if isinstance(out_ls_v, BaseModelOutputWithPooling):
+            v = (out_ls_v.pooler_output).unsqueeze(0)
+        else:
+            v = torch.stack(out_ls_v, dim=1) # bsz, num_loops, embed_dim
+
+        # t_v
+        attn_t_v = self.gqa_t_v(
+            q=t, k=v, v=v, mask=None
+        ) # bsz, num_loops, embed_dim
+        norm_t_v = self.ln_t_v(attn_t_v)
+        ffn_t_v = self.ffn_t_v(
+            norm_t_v
+        ) # bsz, num_loops, embed_dim
+        feature_t_v = ffn_t_v[:,-1] # bsz, embed_dim
+
+        # v_t
+        attn_v_t = self.gqa_v_t(
+            q=v,k=t,v=t, mask=None
+        ) # bsz, num_loops, embed_dim
+        norm_v_t = self.ln_v_t(attn_v_t)
+        ffn_v_t = self.ffn_v_t(
+            norm_v_t
+        ) # bsz, num_loops, embed_dim
+        feature_v_t = ffn_v_t[:,-1] # bsz, embed_dim
+
+        return feature_t_v, feature_v_t
+
+
+
+class OurModel(nn.Module):
+    def __init__(
+        self,
+        clip_path: str,
+    ):
+        super().__init__()
+
+        self._load_looped_models(clip_path)
+
+    def _load_looped_models(clip_path: str) -> None:
+        pass
+
+    def forward(
+        self,
+        num_loops: int=3
+    ):
+        pass
+
+
+        
 
 
 __all__ = [
