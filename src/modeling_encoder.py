@@ -36,7 +36,7 @@ from transformers.utils import (
 )
 from transformers.utils.generic import can_return_tuple, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-from .configuration_encoder import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
+from .configuration_clip import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
 
 logger = logging.get_logger(__name__)
@@ -1008,3 +1008,167 @@ class CLIPForImageClassification(CLIPPreTrainedModel):
         )
 
 
+
+
+
+#####################        Our Model          #########################
+
+
+
+class LoopedCLIPTextModel(CLIPTextModel):
+    def __init__(
+        self,
+        config: CLIPTextConfig,
+    ):
+        super().__init__(config)
+
+        # self.embedding
+        # self.encoder
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        num_loops: int=3,
+        **kwargs: Unpack[TransformersKwargs],
+    ):
+        # input_ids: bsz, seq_len
+        # attention_mask: bsz, seq_len
+        # position_ids: bsz, seq_len
+        if input_ids is None:
+            raise ValueError("You have to specify input_ids")
+
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
+
+        hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
+
+        attention_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=None,
+        )
+
+        kwargs.pop("is_causal", None)
+        encoder_outputs: BaseModelOutput = self.encoder(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            is_causal=True,
+            **kwargs,
+        )
+
+        last_hidden_state = encoder_outputs.last_hidden_state
+        last_hidden_state = self.final_layer_norm(last_hidden_state)
+
+        if self.eos_token_id == 2:
+            # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
+            # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
+            # ------------------------------------------------------------
+            # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+            # take features from the eot embedding (eot_token is the highest number in each sequence)
+            # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+            pooled_output = last_hidden_state[
+                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+            ]
+        else:
+            # The config gets updated `eos_token_id` from PR #24773 (so the use of extra new tokens is possible)
+            pooled_output = last_hidden_state[
+                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
+                # Note: we assume each sequence (along batch dim.) contains an  `eos_token_id` (e.g. prepared by the tokenizer)
+                (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
+                .int()
+                .argmax(dim=-1),
+            ]
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooled_output,
+        )
+
+
+class LoopedCLIPVisionModel(CLIPVisionModel):
+    def __init__(
+        self,
+        config: CLIPVisionConfig,
+    ):
+        super().__init__(config)
+    
+    def forward(
+        self,
+        pixel_values: torch.FloatTensor | None = None,
+        interpolate_pos_encoding: bool | None = False,
+        num_loops: int=3,
+        **kwargs: Unpack[TransformersKwargs],
+    ):
+        pass
+
+
+
+class LoopedCLIPModel(nn.Module):
+    def __init__(self, config, num_loops=3):
+        super().__init__()
+        self.num_loops = num_loops
+        self.text_model = LoopedCLIPTextModel(config.text_config)
+        
+        self.vision_model = LoopedCLIPVisionModel(config.vision_config)
+        self.text_projection = nn.Linear(
+            config.text_config.hidden_size, config.projection_dim, bias=False
+        )
+        self.visual_projection = nn.Linear(
+            config.vision_config.hidden_size, config.projection_dim, bias=False
+        )
+        self.logit_scale = nn.Parameter(
+            torch.ones([]) * config.logit_scale_init_value
+        )
+
+    def forward(self, input_ids=None, pixel_values=None, **kwargs):
+        text_out = self.text_model(
+            input_ids, num_loops=self.num_loops, **kwargs
+        )
+        text_embeds = text_out[:, 0, :]
+        text_embeds = self.text_projection(text_embeds)
+        
+        if pixel_values is not None:
+            vision_out = self.vision_model(pixel_values)[0][:, 0, :]
+            image_embeds = self.visual_projection(vision_out)
+            return text_embeds, image_embeds
+        return text_embeds
+
+
+
+
+
+def load_looped_clip(clip_path, num_loops=3):
+    # 用官方类先加载，拿到 state_dict
+    from transformers import CLIPModel
+    official = CLIPModel.from_pretrained(clip_path)
+    sd = official.state_dict()
+    del official
+    
+    # 初始化你的模型
+    config = CLIPConfig.from_pretrained(clip_path)
+    model = LoopedCLIPTextModel(config, num_loops=num_loops)
+    
+    # 手动加载
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    print(f"Missing: {len(missing)} (这些是你新加的层，随机初始化)")
+    print(f"Unexpected: {len(unexpected)} (ckpt 有但模型没有)")
+    
+    # 如果有新层，手动初始化
+    for name, param in model.named_parameters():
+        if any(k in name for k in ['loop_', 'new_']):  # 你的新层前缀
+            if param.dim() >= 2:
+                nn.init.xavier_uniform_(param)
+    
+    return model
+
+
+__all__ = [
+    'LoopedCLIPTextModel',
+    'LoopedCLIPVisionModel',
+    'LoopedCLIPModel'
+]
