@@ -1,6 +1,6 @@
 # LoopFuse: Loop-wise Cross-modal Fusion for Multimodal Fake News Detection
 
-LoopFuse 做图文假新闻检测。文本和图像各自用一套权重共享的 CLIP encoder 循环编码，留下每一圈的 pooled hidden state。这些圈向量组成一条序列，经双向跨模态注意力融合，取最后一圈的特征判断真假。
+LoopFuse detects image-text fake news. Text and image are each encoded by a weight-shared CLIP encoder with looped encoding, retaining the pooled hidden state from every loop. These loop-wise vectors form a sequence, which is fused via bidirectional cross-modal attention, and the final-loop features are used to predict authenticity.
 
 ```bash
 python train_dp.py --config configs/weibo.yaml

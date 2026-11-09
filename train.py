@@ -11,7 +11,7 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 from tqdm import tqdm
 from transformers import AutoProcessor
 
-from src.modeling_encoder import FullModel
+from src.modeling_loopfuse import FullModel
 from src.utils import (
     build_dataloaders,
     load_checkpoint,
