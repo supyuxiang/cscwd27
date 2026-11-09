@@ -1410,4 +1410,6 @@ class OurModel(nn.Module):
 __all__ = [
     'LoopedCLIPTextModel',
     'LoopedCLIPVisionModel'
+    'Fuse',
+    'OurModel'
 ]
