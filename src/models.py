@@ -12,8 +12,8 @@ import contextlib
 class CLIPEncoder(nn.Module):
     def __init__(
         self,
-        clip_path: str | Path,
         d_model: int,
+        clip_path: str | Path = '/data3/yxfeng/models/clip/clip-vit-large-patch14',
         num_loops: int = 3,
         freeze: bool = True,
         device=torch.device('cuda')
@@ -69,6 +69,10 @@ class CLIPEncoder(nn.Module):
         image_ls: list[torch.Tensor]
     ) -> torch.Tensor:
         pass
+
+    @classmethod
+    def from_config(cls, config) -> 'CLIPEncoder':
+        return cls(config)
 
 
 
@@ -413,156 +417,16 @@ class OurModel(nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-
-
-# ----------------------
-
-# ============================================================
-# 公共组件：逐 token 生成 α, β, S
-# ============================================================
-class ReadWriteMixGenerator(nn.Module):
-    """从 X (B, n, d) 生成 α (B, n), β (B, n), S (B, n, n)"""
-    def __init__(self, d, n):
-        super().__init__()
-        self.w_alpha = nn.Linear(d, n)
-        self.w_beta  = nn.Linear(d, n)
-        self.w_s     = nn.Linear(d, n * n)
-        self.n = n
-
-    def forward(self, X):
-        # 对 n 条流做平均池化，得到每个 token 的聚合表示 (B, d)
-        h = X.mean(dim=1) # b, n, d -> b, d
-        # 逐 token 生成
-        alpha = self.w_alpha(h) # b, n
-        beta  = self.w_beta(h) # b, n
-        S     = self.w_s(h).view(-1, self.n, self.n)  # b, n * n -> b, n, n
-        return alpha, beta, S
-
-
-# ============================================================
-# HC：无约束混合
-# ============================================================
-class HCBlock(nn.Module):
-    def __init__(self, d, n, sublayer):
-        super().__init__()
-        self.gen = ReadWriteMixGenerator(d, n)
-        self.sublayer = sublayer              # 任意 d -> d 的子层（Attention/FFN）
-        self.n = n
-
-    def forward(self, X):
-        # X: (B, n, d)
-        alpha, beta, S = self.gen(X)          # (B,n), (B,n), (B,n,n)
-
-        # --- 读取：h = αᵀ X ---
-        # alpha.unsqueeze(-1): (B, n, 1)，与 X 做加权和
-        h = (alpha.unsqueeze(-1) * X).sum(dim=1)   # (B, d)
-
-        # --- 子层计算 ---
-        y = self.sublayer(h)                        # (B, d)
-
-        # --- 混合：B X ---
-        # S: (B, n, n), X: (B, n, d) -> (B, n, d)
-        mixed = torch.bmm(S, X)
-
-        # --- 写入：+ β yᵀ ---
-        # beta.unsqueeze(-1) * y.unsqueeze(1): (B, n, d)
-        write = beta.unsqueeze(-1) * y.unsqueeze(1)
-
-        X_next = mixed + write                      # (B, n, d)
-        return X_next
-
-
-# ============================================================
-# mHC：Sinkhorn 约束的混合
-# ============================================================
-def sinkhorn(log_alpha, n_iters=5):
-    """
-    log_alpha: (B, n, n) 的打分矩阵（S）
-    返回：双随机矩阵 B (B, n, n)
-    """
-    B = log_alpha.exp()                          # 保证非负
-    for _ in range(n_iters):
-        # 行归一化
-        B = B / B.sum(dim=2, keepdim=True).clamp_min(1e-8)
-        # 列归一化
-        B = B / B.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    return B
-
-
-class mHCBlock(nn.Module):
-    def __init__(self, d, n, sublayer, n_sinkhorn_iters=5):
-        super().__init__()
-        self.gen = ReadWriteMixGenerator(d, n)
-        self.sublayer = sublayer
-        self.n = n
-        self.T = n_sinkhorn_iters
-
-    def forward(self, X):
-        alpha, beta, S = self.gen(X)
-
-        # --- 读取 ---
-        h = (alpha.unsqueeze(-1) * X).sum(dim=1)
-
-        # --- 子层 ---
-        y = self.sublayer(h)
-
-        # --- mHC 的关键差异：Sinkhorn 投影 ---
-        B = sinkhorn(S, self.T)                     # (B, n, n)，双随机
-
-        # --- 混合 + 写入 ---
-        mixed = torch.bmm(B, X)
-        write = beta.unsqueeze(-1) * y.unsqueeze(1)
-
-        X_next = mixed + write
-        return X_next
-
-
-# ============================================================
-# 快速验证：数值稳定性对比
-# ============================================================
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    B, n, d = 2, 4, 16
-    depth = 50
-
-    sublayer = nn.Sequential(
-        nn.Linear(d, d), nn.GELU(), nn.Linear(d, d)
+def test():
+    clipencoder = CLIPEncoder(
+        d_model=256
     )
-
-    # 初始多流状态
-    x0 = torch.randn(B, d)
-    X_init = x0.unsqueeze(1).repeat(1, n, 1)        # (B, n, d)
-
-    # ---- HC ----
-    X = X_init.clone()
-    hc = HCBlock(d, n, sublayer)
-    for _ in range(depth):
-        X = hc(X)
-    print("[HC]  输出范数:", X.norm().item())
-
-    # ---- mHC ----
-    X = X_init.clone()
-    mhc = mHCBlock(d, n, sublayer)
-    for _ in range(depth):
-        X = mhc(X)
-    print("[mHC] 输出范数:", X.norm().item())
-
-    # ---- 验证 Sinkhorn 输出确实是双随机 ----
-    _, _, S = mhc.gen(X)
-    B_mat = sinkhorn(S, n_iters=5)
-    print("\n双随机校验 (应接近 1):")
-    print("  行和:", B_mat.sum(dim=2)[0])   # 应为 [1,1,1,1]
-    print("  列和:", B_mat.sum(dim=1)[0])
+    breakpoint()
 
 
+
+if __name__ == '__main__':
+    test()
 
     
 
