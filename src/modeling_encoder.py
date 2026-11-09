@@ -1143,33 +1143,6 @@ class LoopedCLIPVisionModel(CLIPVisionModel):
 
 
 
-
-def load_looped_clip(clip_path, num_loops=3):
-    # 用官方类先加载，拿到 state_dict
-    from transformers import CLIPModel
-    official = CLIPModel.from_pretrained(clip_path)
-    sd = official.state_dict()
-    del official
-    
-    # 初始化你的模型
-    config = CLIPConfig.from_pretrained(clip_path)
-    model = LoopedCLIPTextModel(config, num_loops=num_loops)
-    
-    # 手动加载
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"Missing: {len(missing)} (这些是你新加的层，随机初始化)")
-    print(f"Unexpected: {len(unexpected)} (ckpt 有但模型没有)")
-    
-    # 如果有新层，手动初始化
-    for name, param in model.named_parameters():
-        if any(k in name for k in ['loop_', 'new_']):  # 你的新层前缀
-            if param.dim() >= 2:
-                nn.init.xavier_uniform_(param)
-    
-    return model
-
-
-
 class GQA(nn.Module):
     def __init__(
         self,
@@ -1302,7 +1275,6 @@ class TransformerEncoderLayer(nn.Module):
 class Fuse(nn.Module):
     def __init__(
         self,
-        num_loops: int,
         embed_dim: int,
         num_heads_q: int,
         num_heads_kv: int,
@@ -1310,7 +1282,6 @@ class Fuse(nn.Module):
     ):
         super().__init__()
 
-        self.num_loops = num_loops
         self.embed_dim = embed_dim
         self.num_heads_q = num_heads_q
         self.num_heads_kv = num_heads_kv
@@ -1385,22 +1356,58 @@ class Fuse(nn.Module):
 
 
 
-class OurModel(nn.Module):
+class FullModel(nn.Module):
     def __init__(
         self,
         clip_path: str,
+        num_heads_q: int,
+        num_heads_kv: int,
+        dropout_p: float=0.1
     ):
         super().__init__()
 
         self._load_looped_models(clip_path)
+        self.embed_dim = self.text_encoder.embed_dim
+        self.fuse = Fuse(
+            embed_dim=self.embed_dim,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            dorpout_p=dropout_p
+        )
 
-    def _load_looped_models(clip_path: str) -> None:
-        pass
+    def _load_looped_models(self, clip_path: str) -> None:
+        from transformers import CLIPModel
+        official = CLIPModel.from_pretrained(
+            clip_path,
+            trust_remote_code=True
+        )
+        sd = official.state_dict()
+        del official
 
+        config = CLIPConfig.from_pretrained(clip_path)
+        self.text_encoder = LoopedCLIPTextModel(config)
+        self.vision_encoder = LoopedCLIPVisionModel(config)
+    
+        missing_text, unexpected_text = self.text_encoder.load_state_dict(sd, strict=False)
+        missing_vision, unexpected_vision = self.vision_encoder.load_state_dict(sd, strict=False)
+
+        # # 如果有新层，手动初始化
+        # for name, param in model.named_parameters():
+        #     if any(k in name for k in ['loop_', 'new_']):  # 你的新层前缀
+        #         if param.dim() >= 2:
+        #             nn.init.xavier_uniform_(param)
+
+    
     def forward(
         self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
         num_loops: int=3
     ):
+        # input_ids: bsz, seq_len, embed_dim
+        # attention_mask: bsz, seq_len
+        # pixel_values: bsz, c, h, w
         pass
 
 
@@ -1411,5 +1418,5 @@ __all__ = [
     'LoopedCLIPTextModel',
     'LoopedCLIPVisionModel'
     'Fuse',
-    'OurModel'
+    'FullModel'
 ]
