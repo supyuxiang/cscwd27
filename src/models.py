@@ -14,11 +14,15 @@ class CLIPEncoder(nn.Module):
         self,
         clip_path: str | Path,
         d_model: int,
+        num_loops: int = 3,
         freeze: bool = True,
+        device=torch.device('cuda')
     ):
         super().__init__()
         self.freeze = freeze
         self.d_model = d_model
+        self.num_loops = num_loops
+        self.device = device
 
         self._load_clip(clip_path) # self.model, self.processor
         self.clip_dim = self.model.config.projection_dim
@@ -26,6 +30,7 @@ class CLIPEncoder(nn.Module):
         self.text_proj = nn.Linear(self.clip_dim, self.d_model)
         self.image_proj = nn.Linear(self.clip_dim, self.d_model)
 
+        self.to(self.device)
 
     def _load_clip(self, clip_path: str | Path):
         is_chinese = ('chinese' in clip_path.split('/')[-1].lower())
@@ -46,31 +51,23 @@ class CLIPEncoder(nn.Module):
                 p.requires_grad_(False)
             self.model.eval()
 
-
     def train(self, mode: bool=True):
         super().train(mode)
         if self.freeze:
             self.clip.eval()
         return self
 
-    def _tokenize(
+
+    def forward_texts(
         self,
-        texts: list[str]
-    ):
+        text_ls: list[str],
+    ) -> torch.Tensor:
         pass
 
-    def _process_images(
+    def forward_images(
         self,
-        images: list[str]
-    ):
-        pass
-
-    def forward(
-        self,
-        input_ids: torch.Tensor, # for text
-        attention_mask: torch.Tensor, # for text
-        pixel_values: torch.Tensor # for image
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        image_ls: list[torch.Tensor]
+    ) -> torch.Tensor:
         pass
 
 
