@@ -1319,6 +1319,7 @@ def _encoder_weights(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[s
     return weights
 
 
+
 class Fuse(nn.Module):
     def __init__(
         self,
