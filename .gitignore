@@ -8,6 +8,8 @@ data/*
 !data/preprocess.py
 *.pt
 *.log
+*.out
+*.err
 .ipynb_checkpoints/
 proposal.md
 paper/

@@ -1,3 +1,5 @@
 [LUMIA Server]Job 147146 lauched on node node4
 START Tue Nov 10 17:08:02 CST 2026 nproc=4 host=gpu-4090-1
 ===== bsz=8 seed=0 micro=8 accum=1 Tue Nov 10 17:08:02 CST 2026 =====
+OK bsz=8 seed=0 micro=8 accum=1
+===== bsz=8 seed=1 micro=8 accum=1 Tue Nov 10 17:32:58 CST 2026 =====
