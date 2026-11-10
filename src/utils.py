@@ -7,7 +7,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, DistributedSampler
 
-from .data import MultimodalDataset, build_collate, load_jsonl_samples, stratified_split
+from .data import LoopFuseDataset, load_jsonl_samples, loopfuse_collator, stratified_split
 
 
 def set_seed(seed: int) -> None:
@@ -60,7 +60,7 @@ def label_counts(samples: list[dict]) -> dict[int, int]:
 
 
 def make_loader(
-    dataset: MultimodalDataset,
+    dataset: LoopFuseDataset,
     processor,
     config: dict,
     *,
@@ -73,7 +73,7 @@ def make_loader(
         shuffle=shuffle and sampler is None,
         sampler=sampler,
         num_workers=int(config.get("num_workers", 0)),
-        collate_fn=build_collate(processor, int(config["max_text_length"])),
+        collate_fn=loopfuse_collator(processor, int(config["max_text_length"])),
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
@@ -100,7 +100,7 @@ def build_dataloaders(
                 f"missing_images={missing[name]}"
             )
 
-    train_set = MultimodalDataset(splits["train"])
+    train_set = LoopFuseDataset(splits["train"])
     train_sampler = (
         DistributedSampler(
             train_set,
@@ -116,12 +116,12 @@ def build_dataloaders(
         train_set, processor, config, shuffle=True, sampler=train_sampler
     )
     val_loader = (
-        make_loader(MultimodalDataset(splits["val"]), processor, config, shuffle=False)
+        make_loader(LoopFuseDataset(splits["val"]), processor, config, shuffle=False)
         if splits["val"] and is_main
         else None
     )
     test_loader = (
-        make_loader(MultimodalDataset(splits["test"]), processor, config, shuffle=False)
+        make_loader(LoopFuseDataset(splits["test"]), processor, config, shuffle=False)
         if splits["test"] and is_main
         else None
     )

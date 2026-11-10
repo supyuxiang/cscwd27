@@ -1501,14 +1501,14 @@ class LoopFuse(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
 
 
-    def process_texts(self, texts: list[str]) -> torch.Tensor:
+    def process_texts(self, texts: list[str]):
         if isinstance(texts, str):
             texts = [texts]
         processed = self.tokenizer(texts, padding=True, truncation=True,
                max_length=50, return_tensors="pt")
         return processed # input_ids=t["input_ids"], attention_mask=t["attention_mask"]
 
-    def process_images(self, images: list[str]) -> torch.Tensor:
+    def process_images(self, images: list[str]):
         if isinstance(images, str):
             images = [images]
         from PIL import Image
@@ -1546,6 +1546,11 @@ class LoopFuse(nn.Module):
         feature_t_v, feature_v_t = self.fuse(text_loops, vision_loops)
         return self.classifier(torch.cat([feature_t_v, feature_v_t], dim=-1))
 
+
+    def compute_loss(self, batch_inputs, batch_labels) -> torch.Tensor:
+        pass
+
+    
 
         
 
