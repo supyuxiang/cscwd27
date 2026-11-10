@@ -7,8 +7,6 @@ embedding space and fused across loops.
 
 from __future__ import annotations
 
-import contextlib
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -115,16 +113,9 @@ class GQA(nn.Module):
         q = self.wq(q).view(bsz, seq_len_q, self.num_heads_q, self.d_k).transpose(1, 2)
         k = self.wk(k).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1, 2)
         v = self.wv(v).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1, 2)
-        use_flash = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
-        flash_ctx = (
-            torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION])
-            if use_flash
-            else contextlib.nullcontext()
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, enable_gqa=True
         )
-        with flash_ctx:
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, enable_gqa=True
-            )
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len_q, -1)
         return self.wo(attn_out)
 

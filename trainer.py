@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 import torch.distributed as dist
 from hydra import compose, initialize
@@ -147,7 +149,7 @@ class LoopFuseTrainer:
             trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
             print(
                 f"{baseline}: {trainable} trainable / {total} parameters, "
-                f"loops={self.num_loops}, device={self.device}"
+                f"loops={self.num_loops}, deterministic=True, device={self.device}"
             )
         return model
 

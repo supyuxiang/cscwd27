@@ -1177,17 +1177,9 @@ class GQA(nn.Module):
         # bsz, seq_len_kv, d_model -> bsz, seq_len_kv, num_heads_kv, d_k -> bsz, num_heads_kv, seq_len_kv, d_k
         k = self.wk(k).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1,2)
         v = self.wv(v).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1,2)
-        # Flash only accepts fp16/bf16. Otherwise leave the kernel choice to SDPA.
-        use_flash_ctx = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
-
-        # scaled_dot_product_attention with flash_attn_v2
-        with (
-            torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION])
-            if use_flash_ctx else contextlib.nullcontext()
-        ):
-            attn_out = F.scaled_dot_product_attention(
-                q,k,v,attn_mask=mask, dropout_p=0.0, is_causal=False, enable_gqa=True
-            ) # bsz, num_heads_q, seq_len_q, d_k
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, enable_gqa=True
+        )
         # bsz, seq_len_q, num_heads_q, d_k -> bsz, seq_len_q, d_model
         attn_out = attn_out.transpose(1,2).contiguous().view(bsz, seq_len_q, -1)
         out = self.wo(attn_out)
