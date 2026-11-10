@@ -17,7 +17,6 @@ from transformers import AutoProcessor
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from src.modeling_loopfuse import LoopFuse
 from src.utils import build_dataloaders, move_batch, run_epoch_eval, set_seed
 
 
@@ -124,6 +123,10 @@ class LoopFuseTrainer:
     def _build_models(self) -> torch.nn.Module:
         num_heads_q = int(self.config.get("num_heads_q", self.config.get("n_heads", 8)))
         num_heads_kv = int(self.config.get("num_heads_kv", num_heads_q))
+        if str(self.config.get("model_type", "clip")) == "chinese":
+            from src.modeling_loopfuse_chinese import LoopFuse
+        else:
+            from src.modeling_loopfuse import LoopFuse
         model = LoopFuse(
             clip_path=str(self.config["clip_name"]),
             num_heads_q=num_heads_q,
@@ -131,8 +134,12 @@ class LoopFuseTrainer:
             dropout_p=float(self.config.get("dropout", 0.1)),
             num_classes=int(self.config.get("num_classes", 2)),
         )
-        for parameter in model.parameters():
-            parameter.requires_grad = True
+        frozen = bool(self.config.get("freeze_backbone", False))
+        for name, parameter in model.named_parameters():
+            if frozen and not any(key in name for key in ("fuse", "classifier", "text_projection", "visual_projection")):
+                parameter.requires_grad = False
+            else:
+                parameter.requires_grad = True
         model.to(self.device)
         if self.distributed:
             model = DDP(
