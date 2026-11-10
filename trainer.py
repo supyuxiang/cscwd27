@@ -57,8 +57,8 @@ class LoopFuseTrainer:
         set_seed(int(config.get("seed", 42)))
 
         self.num_loops = int(config.get("num_loops", 3))
-        self.epochs = int(config["epochs"])
-        self.patience = int(config.get("patience", 0))
+        self.epochs = int(config.get("epochs", 50))
+        self.patience = int(config.get("patience", 5))
         self.accum_steps = max(int(config.get("grad_accum_steps", 1)), 1)
         self.max_grad_norm = float(config.get("max_grad_norm", 1.0))
         self.output_dir = Path(config.get("output_dir", "outputs/run"))
@@ -288,15 +288,19 @@ class LoopFuseTrainer:
                 self._save("last.pt", epoch, metrics)
             if self._should_stop(stop):
                 if self.is_main:
-                    print(f"early stop at epoch {epoch}")
+                    print(f"early stop at epoch {epoch}, best val macro_f1 {best_score:.4f}")
                 break
         if self.is_main and self.val_loader is None:
             self._save("best.pt", epoch, None)
         if self.is_main and self.test_loader is not None:
             best_path = self.output_dir / "best.pt"
+            best_epoch = None
             if best_path.is_file():
                 checkpoint = torch.load(best_path, map_location=self.device, weights_only=False)
                 self._unwrap().load_state_dict(checkpoint["model"])
+                best_epoch = checkpoint.get("epoch")
+            if best_epoch is not None:
+                print(f"test checkpoint epoch {best_epoch}")
             metrics, report = self.evaluate(self.test_loader)
             self.logger.log({f"test/{key}": value for key, value in metrics.items()}, step=self.epochs)
             print("test", " ".join(f"{key}={value:.4f}" for key, value in metrics.items()))
