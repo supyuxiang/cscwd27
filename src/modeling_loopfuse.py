@@ -1097,7 +1097,7 @@ class LoopedCLIPTextModel(CLIPTextModel):
                 )
             )
 
-            hidden_states = last_hidden_state # bsz, seq_len, embed_dim
+            hidden_states = last_hidden_state # bsz, seq_len, text_hidden
 
         return out_ls
 
@@ -1137,7 +1137,7 @@ class LoopedCLIPVisionModel(CLIPVisionModel):
                 )
             )
 
-            hidden_states = last_hidden_state
+            hidden_states = last_hidden_state # bsz, seq_len, vision_hidden
             
         return out_ls
 
@@ -1393,7 +1393,7 @@ class Fuse(nn.Module):
                 f"Fuse expected embed_dim={self.embed_dim}, got text {tuple(t.shape)} and vision {tuple(v.shape)}."
             )
 
-        # t_v
+        # cross-attention t_to_v
         attn_t_v = self.gqa_t_v(
             q=t, k=v, v=v, mask=None
         ) # bsz, num_loops, embed_dim
@@ -1403,7 +1403,7 @@ class Fuse(nn.Module):
         ) # bsz, num_loops, embed_dim
         feature_t_v = ffn_t_v[:,-1] # bsz, embed_dim
 
-        # v_t
+        # cross-attention v_to_t
         attn_v_t = self.gqa_v_t(
             q=v,k=t,v=t, mask=None
         ) # bsz, num_loops, embed_dim
@@ -1430,16 +1430,16 @@ class LoopFuse(nn.Module):
         self.num_classes = num_classes
         self._load_looped_models(clip_path)
         self.fuse = Fuse(
-            embed_dim=self.embed_dim,
+            embed_dim=self.projection_dim,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             dropout_p=dropout_p,
         )
         self.classifier = nn.Sequential(
-            nn.Linear(self.embed_dim * 2, self.embed_dim),
+            nn.Linear(self.projection_dim * 2, self.projection_dim),
             nn.ReLU(),
             nn.Dropout(dropout_p),
-            nn.Linear(self.embed_dim, num_classes),
+            nn.Linear(self.projection_dim, num_classes),
         )
 
     def _load_looped_models(self, clip_path: str) -> None:
@@ -1458,33 +1458,48 @@ class LoopFuse(nn.Module):
         self.text_encoder.load_state_dict(_encoder_weights(state_dict, "text_model"), strict=True)
         self.vision_encoder.load_state_dict(_encoder_weights(state_dict, "vision_model"), strict=True)
 
-        text_hidden = int(config.text_config.hidden_size)
-        vision_hidden = int(config.vision_config.hidden_size)
+        self.text_hidden = int(config.text_config.hidden_size)
+        self.vision_hidden = int(config.vision_config.hidden_size)
+        self.projection_dim = int(config.projection_dim)
         # Fuse reads one shared width. Keep the text loop hidden states as they are,
         # and map vision CLS states into that width when the towers differ.
-        self.embed_dim = text_hidden
-        if text_hidden == vision_hidden:
-            self.vision_align = nn.Identity()
-            return
+        
+        self.text_projection = nn.Linear(self.text_hidden, self.projection_dim)
+        self.visual_projection = nn.Linear(self.vision_hidden, self.projection_dim)
+
+        # self.embed_dim = text_hidden
+        # if text_hidden == vision_hidden:
+        #     self.vision_align = nn.Identity()
+        #     return
 
         if "text_projection.weight" not in state_dict or "visual_projection.weight" not in state_dict:
             raise RuntimeError(
                 "CLIP text and vision hidden sizes differ, but the checkpoint has no "
                 "text_projection/visual_projection weights to initialize the alignment."
             )
-        self.vision_align = nn.Linear(vision_hidden, text_hidden, bias=False)
-        text_weight = state_dict["text_projection.weight"]
-        vision_weight = state_dict["visual_projection.weight"]
-        # Solve text_projection(align(v)) ~= visual_projection(v).
-        solution = torch.linalg.lstsq(text_weight.float(), vision_weight.float()).solution
-        if tuple(solution.shape) != (text_hidden, vision_hidden):
-            raise RuntimeError(
-                f"Vision alignment init produced shape {tuple(solution.shape)}, "
-                f"expected {(text_hidden, vision_hidden)}."
-            )
-        with torch.no_grad():
-            self.vision_align.weight.copy_(solution.to(dtype=self.vision_align.weight.dtype))
 
+        with torch.no_grad():
+            self.text_projection.weight.copy_(
+                state_dict['text_projection.weight']
+            )
+            if state_dict.get('text_projection.bias',None) is not None:
+                self.text_projection.bias.copy_(
+                    state_dict['text_projection.bias']
+                )
+            else:
+                self.text_projection.bias = None
+
+            self.visual_projection.weight.copy_(
+                state_dict['visual_projection.weight']
+            )
+            if state_dict.get('visual_projection.bias', None) is not None:
+                self.visual_projection.bias.copy_(
+                    state_dict['visual_projection.bias']
+                )
+            else:
+                self.visual_projection.bias = None
+                
+        
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1509,8 +1524,8 @@ class LoopFuse(nn.Module):
             pixel_values=pixel_values,
             num_loops=num_loops,
         )
-        text_loops = [out.pooler_output for out in text_outs]
-        vision_loops = [self.vision_align(out.pooler_output) for out in vision_outs]
+        text_loops = [self.text_projection(out.pooler_output) for out in text_outs]
+        vision_loops = [self.visual_projection(out.pooler_output) for out in vision_outs]
         feature_t_v, feature_v_t = self.fuse(text_loops, vision_loops)
         return self.classifier(torch.cat([feature_t_v, feature_v_t], dim=-1))
 
