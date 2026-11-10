@@ -1464,8 +1464,8 @@ class LoopFuse(nn.Module):
         # Fuse reads one shared width. Keep the text loop hidden states as they are,
         # and map vision CLS states into that width when the towers differ.
         
-        self.text_projection = nn.Linear(self.text_hidden, self.projection_dim, bias=True)
-        self.visual_projection = nn.Linear(self.vision_hidden, self.projection_dim, bias=True)
+        self.text_projection = nn.Linear(self.text_hidden, self.projection_dim, bias=False)
+        self.visual_projection = nn.Linear(self.vision_hidden, self.projection_dim, bias=False)
 
         # self.embed_dim = text_hidden
         # if text_hidden == vision_hidden:
@@ -1475,25 +1475,8 @@ class LoopFuse(nn.Module):
         assert ("text_projection.weight" in state_dict) and ("visual_projection.weight" in state_dict)
 
         with torch.no_grad():
-            self.text_projection.weight.copy_(
-                state_dict['text_projection.weight']
-            )
-            if state_dict.get('text_projection.bias',None) is not None:
-                self.text_projection.bias.copy_(
-                    state_dict['text_projection.bias']
-                )
-            else:
-                self.text_projection.bias = None
-
-            self.visual_projection.weight.copy_(
-                state_dict['visual_projection.weight']
-            )
-            if state_dict.get('visual_projection.bias', None) is not None:
-                self.visual_projection.bias.copy_(
-                    state_dict['visual_projection.bias']
-                )
-            else:
-                self.visual_projection.bias = None
+            self.text_projection.weight.copy_(state_dict["text_projection.weight"])
+            self.visual_projection.weight.copy_(state_dict["visual_projection.weight"])
 
 
         # load processor and tokenizer
