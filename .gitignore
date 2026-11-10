@@ -13,3 +13,6 @@ data/*
 .ipynb_checkpoints/
 proposal.md
 paper/
+logs/
+.deps/
+/data

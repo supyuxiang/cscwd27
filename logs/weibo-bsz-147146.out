@@ -5,3 +5,39 @@ OK bsz=8 seed=0 micro=8 accum=1
 ===== bsz=8 seed=1 micro=8 accum=1 Tue Nov 10 17:32:58 CST 2026 =====
 OK bsz=8 seed=1 micro=8 accum=1
 ===== bsz=8 seed=2 micro=8 accum=1 Tue Nov 10 17:51:35 CST 2026 =====
+OK bsz=8 seed=2 micro=8 accum=1
+===== bsz=8 seed=3 micro=8 accum=1 Tue Nov 10 18:16:33 CST 2026 =====
+OK bsz=8 seed=3 micro=8 accum=1
+===== bsz=16 seed=0 micro=16 accum=1 Tue Nov 10 18:44:59 CST 2026 =====
+OK bsz=16 seed=0 micro=16 accum=1
+===== bsz=16 seed=1 micro=16 accum=1 Tue Nov 10 18:59:36 CST 2026 =====
+OK bsz=16 seed=1 micro=16 accum=1
+===== bsz=16 seed=2 micro=16 accum=1 Tue Nov 10 19:13:06 CST 2026 =====
+OK bsz=16 seed=2 micro=16 accum=1
+===== bsz=16 seed=3 micro=16 accum=1 Tue Nov 10 19:31:05 CST 2026 =====
+OK bsz=16 seed=3 micro=16 accum=1
+===== bsz=32 seed=0 micro=32 accum=1 Tue Nov 10 19:45:35 CST 2026 =====
+OK bsz=32 seed=0 micro=32 accum=1
+===== bsz=32 seed=1 micro=32 accum=1 Tue Nov 10 20:00:48 CST 2026 =====
+OK bsz=32 seed=1 micro=32 accum=1
+===== bsz=32 seed=2 micro=32 accum=1 Tue Nov 10 20:08:28 CST 2026 =====
+OK bsz=32 seed=2 micro=32 accum=1
+===== bsz=32 seed=3 micro=32 accum=1 Tue Nov 10 20:16:39 CST 2026 =====
+OK bsz=32 seed=3 micro=32 accum=1
+===== bsz=64 seed=0 micro=64 accum=1 Tue Nov 10 20:28:43 CST 2026 =====
+OOM retry bsz=64 seed=0 micro=32 accum=2
+===== bsz=64 seed=0 micro=32 accum=2 Tue Nov 10 20:29:04 CST 2026 =====
+OK bsz=64 seed=0 micro=32 accum=2
+===== bsz=64 seed=1 micro=64 accum=1 Tue Nov 10 20:40:21 CST 2026 =====
+OOM retry bsz=64 seed=1 micro=32 accum=2
+===== bsz=64 seed=1 micro=32 accum=2 Tue Nov 10 20:40:42 CST 2026 =====
+OK bsz=64 seed=1 micro=32 accum=2
+===== bsz=64 seed=2 micro=64 accum=1 Tue Nov 10 20:47:50 CST 2026 =====
+OOM retry bsz=64 seed=2 micro=32 accum=2
+===== bsz=64 seed=2 micro=32 accum=2 Tue Nov 10 20:48:11 CST 2026 =====
+OK bsz=64 seed=2 micro=32 accum=2
+===== bsz=64 seed=3 micro=64 accum=1 Tue Nov 10 20:57:58 CST 2026 =====
+OOM retry bsz=64 seed=3 micro=32 accum=2
+===== bsz=64 seed=3 micro=32 accum=2 Tue Nov 10 20:58:19 CST 2026 =====
+OK bsz=64 seed=3 micro=32 accum=2
+ALL_DONE fail=0 Tue Nov 10 21:11:12 CST 2026
