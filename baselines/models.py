@@ -20,9 +20,13 @@ from .lora import LoopLoRABank, attention_linears
 
 def resolve_backbone(config: dict, model_type: str) -> str:
     requested = str(config.get("backbone", "")).lower()
-    if requested in {"clip", "chinese"}:
+    if requested in {"clip", "chinese", "jina"}:
         return requested
-    if model_type == "chinese" or "chinese" in str(config.get("clip_name", "")).lower():
+    kind = model_type.lower()
+    clip_name = str(config.get("clip_name", "")).lower()
+    if kind in {"jina", "jina-clip", "jinaclip"} or "jina-clip" in clip_name:
+        return "jina"
+    if kind == "chinese" or "chinese" in clip_name:
         return "chinese"
     return "clip"
 
@@ -30,6 +34,17 @@ def resolve_backbone(config: dict, model_type: str) -> str:
 def _loopfuse_class(backbone: str):
     if backbone == "chinese":
         from src.modeling_loopfuse_chinese import LoopFuse
+    elif backbone == "jina":
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "src" / "modeling_loopfuse_jina-clip.py"
+        spec = importlib.util.spec_from_file_location("modeling_loopfuse_jina_clip", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.LoopFuse
     else:
         from src.modeling_loopfuse import LoopFuse
     return LoopFuse
