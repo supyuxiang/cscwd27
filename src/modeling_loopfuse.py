@@ -1522,5 +1522,5 @@ __all__ = [
     'LoopedCLIPTextModel',
     'LoopedCLIPVisionModel',
     'Fuse',
-    'FullModel'
+    'LoopFuse'
 ]
