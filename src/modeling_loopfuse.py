@@ -1443,7 +1443,7 @@ class LoopFuse(nn.Module):
         )
 
     def _load_looped_models(self, clip_path: str) -> None:
-        from transformers import CLIPModel
+        from transformers import CLIPModel, AutoProcessor, AutoTokenizer
 
         official = CLIPModel.from_pretrained(
             clip_path,
@@ -1498,8 +1498,28 @@ class LoopFuse(nn.Module):
                 )
             else:
                 self.visual_projection.bias = None
-                
-        
+
+
+        # load processor and tokenizer
+        self.processor = AutoProcessor.from_pretrained(clip_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
+
+
+    def process_texts(self, texts: list[str]) -> torch.Tensor:
+        if isinstance(texts, str):
+            texts = [texts]
+        processed = self.tokenizer(texts, padding=True, return_tensors="pt")
+        return processed
+
+    def process_images(self, images: list[str]) -> torch.Tensor:
+        if isinstance(images, str):
+            images = [images]
+        from PIL import Image
+        images = [Image.open(image, 'rgb') for image in images]
+        processed = self.processor(images=images, return_tensors="pt")
+        return processed
+
+
     def forward(
         self,
         input_ids: torch.Tensor,
