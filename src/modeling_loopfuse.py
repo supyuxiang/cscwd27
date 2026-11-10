@@ -1472,11 +1472,7 @@ class LoopFuse(nn.Module):
         #     self.vision_align = nn.Identity()
         #     return
 
-        if "text_projection.weight" not in state_dict or "visual_projection.weight" not in state_dict:
-            raise RuntimeError(
-                "CLIP text and vision hidden sizes differ, but the checkpoint has no "
-                "text_projection/visual_projection weights to initialize the alignment."
-            )
+        assert ("text_projection.weight" in state_dict) and ("visual_projection.weight" in state_dict)
 
         with torch.no_grad():
             self.text_projection.weight.copy_(
@@ -1508,16 +1504,17 @@ class LoopFuse(nn.Module):
     def process_texts(self, texts: list[str]) -> torch.Tensor:
         if isinstance(texts, str):
             texts = [texts]
-        processed = self.tokenizer(texts, padding=True, return_tensors="pt")
-        return processed
+        processed = self.tokenizer(texts, padding=True, truncation=True,
+               max_length=50, return_tensors="pt")
+        return processed # input_ids=t["input_ids"], attention_mask=t["attention_mask"]
 
     def process_images(self, images: list[str]) -> torch.Tensor:
         if isinstance(images, str):
             images = [images]
         from PIL import Image
-        images = [Image.open(image, 'rgb') for image in images]
+        images = [Image.open(p).convert("RGB") for p in images]
         processed = self.processor(images=images, return_tensors="pt")
-        return processed
+        return processed # pixel_values=v["pixel_values"]
 
 
     def forward(
