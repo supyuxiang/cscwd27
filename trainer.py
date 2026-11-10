@@ -21,7 +21,7 @@ from src.modeling_loopfuse import LoopFuse
 from src.utils import build_dataloaders, move_batch, run_epoch_eval, set_seed
 
 
-class _SwanLogger:
+class SwanLogger:
     def __init__(self, enabled: bool, config: dict, output_dir: Path):
         self.enabled = enabled
         if not enabled:
@@ -50,8 +50,11 @@ class _SwanLogger:
 class LoopFuseTrainer:
     def __init__(self, config: dict):
         self.config = config
+
         self._init_distributed()
+
         set_seed(int(config.get("seed", 42)))
+
         self.num_loops = int(config.get("num_loops", 3))
         self.epochs = int(config["epochs"])
         self.patience = int(config.get("patience", 0))
@@ -60,17 +63,24 @@ class LoopFuseTrainer:
         self.output_dir = Path(config.get("output_dir", "outputs/run"))
         if not self.output_dir.is_absolute():
             self.output_dir = ROOT / self.output_dir
+
         self.logger = self._build_swanlab_logger()
+
         (
             self.train_loader,
             self.val_loader,
             self.test_loader,
             self.train_sampler,
         ) = self._build_dataloader()
+
         self.model = self._build_models()
+
         self.optimizer = self._build_optimizer()
+
         self.scheduler = self._build_scheduler()
+
         self.loss_fn = self._build_loss()
+
         self.amp_dtype, self.scaler = self._amp()
 
     def _init_distributed(self) -> None:
@@ -90,12 +100,13 @@ class LoopFuseTrainer:
             self.rank = 0
             self.world_size = 1
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.is_main = self.rank == 0
 
-    def _build_swanlab_logger(self) -> _SwanLogger:
+        self.is_main = (self.rank == 0)
+
+    def _build_swanlab_logger(self) -> SwanLogger:
         if self.is_main:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-        return _SwanLogger(self.is_main, self.config, self.output_dir)
+        return SwanLogger(self.is_main, self.config, self.output_dir)
 
     def _build_dataloader(self):
         processor = AutoProcessor.from_pretrained(str(self.config["clip_name"]), trust_remote_code=True)
