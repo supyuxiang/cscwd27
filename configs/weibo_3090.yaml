@@ -1,5 +1,5 @@
 model_type: chinese
-clip_name: /data3/yxfeng/clip/chinese-clip-vit-base-patch16
+clip_name: /data3/yxfeng/models/clip/chinese-clip-vit-base-patch16
 n_heads: 8
 num_heads_kv: 4
 dropout: 0.1

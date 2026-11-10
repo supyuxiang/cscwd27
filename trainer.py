@@ -121,26 +121,21 @@ class LoopFuseTrainer:
         )
 
     def _build_models(self) -> torch.nn.Module:
-        num_heads_q = int(self.config.get("num_heads_q", self.config.get("n_heads", 8)))
-        num_heads_kv = int(self.config.get("num_heads_kv", num_heads_q))
-        if str(self.config.get("model_type", "clip")) == "chinese":
-            from src.modeling_loopfuse_chinese import LoopFuse
-        else:
-            from src.modeling_loopfuse import LoopFuse
-        model = LoopFuse(
-            clip_path=str(self.config["clip_name"]),
-            num_heads_q=num_heads_q,
-            num_heads_kv=num_heads_kv,
-            dropout_p=float(self.config.get("dropout", 0.1)),
-            num_classes=int(self.config.get("num_classes", 2)),
-        )
+        from baselines import build_detector
+
+        model = build_detector(self.config)
+        forced = getattr(model, "forced_loops", None)
+        if forced is not None:
+            self.num_loops = int(forced)
         frozen = bool(self.config.get("freeze_backbone", False))
+        trainable_when_frozen = ("fuse", "classifier", "text_projection", "visual_projection", "lora")
         for name, parameter in model.named_parameters():
-            if frozen and not any(key in name for key in ("fuse", "classifier", "text_projection", "visual_projection")):
+            if frozen and not any(key in name for key in trainable_when_frozen):
                 parameter.requires_grad = False
             else:
                 parameter.requires_grad = True
         model.to(self.device)
+        baseline = getattr(model, "baseline_name", model.__class__.__name__)
         if self.distributed:
             model = DDP(
                 model,
@@ -149,7 +144,11 @@ class LoopFuseTrainer:
             )
         if self.is_main:
             total = sum(parameter.numel() for parameter in model.parameters())
-            print(f"full finetune: {total} parameters, loops={self.num_loops}, device={self.device}")
+            trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+            print(
+                f"{baseline}: {trainable} trainable / {total} parameters, "
+                f"loops={self.num_loops}, device={self.device}"
+            )
         return model
 
     def _build_optimizer(self) -> torch.optim.Optimizer:

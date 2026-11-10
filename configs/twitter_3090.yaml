@@ -1,3 +1,4 @@
+model_type: clip
 clip_name: /data3/yxfeng/models/clip/clip-vit-base-patch32
 n_heads: 8
 num_heads_kv: 4
