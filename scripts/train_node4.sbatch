@@ -46,5 +46,5 @@ echo "job=${SLURM_JOB_ID} node=$(hostname) config=${CONFIG}"
   --rdzv_backend=c10d \
   --rdzv_endpoint="127.0.0.1:${MASTER_PORT}" \
   --rdzv_id="${SLURM_JOB_ID}" \
-  train_ddp.py \
+  trainer.py \
   --config "${CONFIG}"

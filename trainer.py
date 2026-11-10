@@ -15,8 +15,7 @@ from tqdm import tqdm
 from transformers import AutoProcessor
 
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 from src.modeling_loopfuse import LoopFuse
 from src.utils import build_dataloaders, move_batch, run_epoch_eval, set_seed

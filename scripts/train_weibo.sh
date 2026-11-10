@@ -1,3 +1,3 @@
 #!/bin/bash
 cd "$(dirname "$0")/.."
-python train_dp.py --config configs/weibo.yaml
+torchrun --nproc_per_node=4 trainer.py --config=weibo
