@@ -1192,7 +1192,21 @@ class GQA(nn.Module):
         attn_out = attn_out.transpose(1,2).contiguous().view(bsz, seq_len_q, -1)
         out = self.wo(attn_out)
         return out
-    
+
+
+class MHA(GQA):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads:int,
+    ):
+        super().__init__(
+            d_model=d_model,
+            num_heads_q=num_heads,
+            num_heads_kv=num_heads
+        )
+        assert d_model % num_heads == 0, (num_heads, d_model)
+
 
 class FFN(nn.Module):
     def __init__(
@@ -1289,8 +1303,7 @@ def _stack_loop_features(outputs) -> torch.Tensor:
                     "Loop features must be pooled tensors or BaseModelOutputWithPooling, "
                     f"got {type(item).__name__}."
                 )
-        if not pooled:
-            raise ValueError("Loop feature list is empty.")
+        assert pooled
         return torch.stack(pooled, dim=1)
 
     if features.dim() == 2:
@@ -1301,6 +1314,7 @@ def _stack_loop_features(outputs) -> torch.Tensor:
         "Pooled loop features must have shape [batch, dim] or [batch, loops, dim], "
         f"got {tuple(features.shape)}."
     )
+
 
 
 def _encoder_weights(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
@@ -1403,7 +1417,7 @@ class Fuse(nn.Module):
 
 
 
-class FullModel(nn.Module):
+class LoopFuse(nn.Module):
     def __init__(
         self,
         clip_path: str,
