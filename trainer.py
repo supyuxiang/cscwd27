@@ -87,11 +87,13 @@ class LoopFuseTrainer:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.distributed = world_size > 1
         if self.distributed:
-            if not torch.cuda.is_available():
-                raise RuntimeError("DDP training expects CUDA. Launch with torchrun.")
+            assert torch.cuda.is_available()
+
             dist.init_process_group(backend="nccl")
+            
             self.local_rank = int(os.environ["LOCAL_RANK"])
             torch.cuda.set_device(self.local_rank)
+            
             self.device = torch.device("cuda", self.local_rank)
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
