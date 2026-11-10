@@ -10,7 +10,7 @@ import torch.distributed as dist
 from hydra import compose, initialize
 from omegaconf import OmegaConf
 from torch.nn import CrossEntropyLoss
-from torch.nn.parallel import DistributedDataParallel
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from transformers import AutoProcessor
 
@@ -133,7 +133,7 @@ class LoopFuseTrainer:
             parameter.requires_grad = True
         model.to(self.device)
         if self.distributed:
-            model = DistributedDataParallel(
+            model = DDP(
                 model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
@@ -173,7 +173,7 @@ class LoopFuseTrainer:
         return torch.float16, scaler
 
     def _unwrap(self) -> torch.nn.Module:
-        return self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+        return self.model.module if isinstance(self.model, DDP) else self.model
 
     def _forward_loss(self, batch: dict) -> torch.Tensor:
         enabled = self.amp_dtype is not None
