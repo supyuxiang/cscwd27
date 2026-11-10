@@ -1464,8 +1464,8 @@ class LoopFuse(nn.Module):
         # Fuse reads one shared width. Keep the text loop hidden states as they are,
         # and map vision CLS states into that width when the towers differ.
         
-        self.text_projection = nn.Linear(self.text_hidden, self.projection_dim)
-        self.visual_projection = nn.Linear(self.vision_hidden, self.projection_dim)
+        self.text_projection = nn.Linear(self.text_hidden, self.projection_dim, bias=True)
+        self.visual_projection = nn.Linear(self.vision_hidden, self.projection_dim, bias=True)
 
         # self.embed_dim = text_hidden
         # if text_hidden == vision_hidden:
