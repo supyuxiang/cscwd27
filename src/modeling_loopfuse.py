@@ -1172,13 +1172,13 @@ class GQA(nn.Module):
         assert q.size(-1) == k.size(-1) == v.size(-1) == self.d_model, (q.size(-1), k.size(-1), v.size(-1))
         assert k.size(1) == v.size(1), (k.size(1), v.size(1))
         bsz, seq_len_q, seq_len_kv = q.size(0), q.size(1), k.size(1)
-        # Flash kernels are CUDA-only. On CPU, the default SDPA backend still runs GQA.
-        use_flash_ctx = self.d_k <= 256 and q.is_cuda
         # bsz, seq_len_q, d_model -> bsz, seq_len_q, num_heads_q, d_k -> bsz, num_heads_q, seq_len_q, d_k
         q = self.wq(q).view(bsz, seq_len_q, self.num_heads_q, self.d_k).transpose(1,2)
         # bsz, seq_len_kv, d_model -> bsz, seq_len_kv, num_heads_kv, d_k -> bsz, num_heads_kv, seq_len_kv, d_k
         k = self.wk(k).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1,2)
         v = self.wv(v).view(bsz, seq_len_kv, self.num_heads_kv, self.d_k).transpose(1,2)
+        # Flash only accepts fp16/bf16. Otherwise leave the kernel choice to SDPA.
+        use_flash_ctx = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
 
         # scaled_dot_product_attention with flash_attn_v2
         with (
