@@ -114,3 +114,27 @@ def build_collate(processor, max_text_length: int):
         return encoded
 
     return collate
+
+
+
+
+
+class LoopFuseDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+    ):
+        super().__init__()
+        pass
+
+    def __len__(self):
+        pass
+
+    def __getitem__(self):
+        pass
+
+
+
+def loopfuse_collator(batch):
+    return
+
+
