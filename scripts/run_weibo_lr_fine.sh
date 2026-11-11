@@ -1,8 +1,9 @@
 #!/bin/bash
 # Fine learning-rate sweep after logs/weibo_lr_resweep.log.
 # Reads the coarse MEAN lines, takes the lr with the highest mean test
-# macro F1, and runs four nearby rates at seeds 0-3 on the same 2x3090
-# global-batch-128 recipe.
+# macro F1, and runs four nearby rates at seeds 0-3.
+# Global batch stays 128: 4 GPUs use microbatch 32 and accumulation 1;
+# 2 GPUs use microbatch 32 and accumulation 2.
 set -uo pipefail
 cd /home/yxfeng/cscwd27_loopfuse
 mkdir -p logs outputs/weibo_lr_fine
@@ -67,7 +68,11 @@ for spec in "${SETTINGS[@]}"; do
   read -r tag lr min_lr <<< "${spec}"
   for seed in 0 1 2 3; do
     micro=32
-    accum=2
+    if [ "${NPROC}" -ge 4 ]; then
+      accum=1
+    else
+      accum=2
+    fi
     while true; do
       log="logs/weibo_fine_${tag}_seed${seed}_m${micro}.log"
       echo "===== ${tag} lr=${lr} min_lr=${min_lr} seed=${seed} micro=${micro} accum=${accum} $(date) =====" | tee -a "$SUMMARY"
