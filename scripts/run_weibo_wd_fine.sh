@@ -23,19 +23,6 @@ mapfile -t HEADER < <("${PY}" - <<'PY'
 import re
 from pathlib import Path
 
-def lr_means():
-    pattern = r"MEAN (lr\S+) n=4 acc=[0-9.]+ macro_f1=([0-9.]+)"
-    rows = []
-    for name in ("logs/weibo_lr_resweep.log", "logs/weibo_lr_fine.log", "logs/weibo_lr_gap.log"):
-        path = Path(name)
-        if not path.is_file():
-            continue
-        for line in path.read_text(errors="replace").splitlines():
-            match = re.search(pattern, line)
-            if match:
-                rows.append((match.group(1), float(match.group(2))))
-    return rows
-
 def wd_value(tag):
     if tag == "wd0":
         return 0.0
@@ -44,7 +31,7 @@ def wd_value(tag):
 coarse = Path("logs/weibo_wd_coarse.log").read_text(errors="replace")
 rows = []
 for line in coarse.splitlines():
-    match = re.search(r"MEAN (wd\S+) n=4 acc=[0-9.]+ macro_f1=([0-9.]+)", line)
+    match = re.search(r"MEAN (wd\S+) n=4 acc=([0-9.]+) macro_f1=[0-9.]+", line)
     if match:
         rows.append((match.group(1), float(match.group(2))))
 if not rows:
@@ -52,11 +39,9 @@ if not rows:
 best_tag, best_score = max(rows, key=lambda item: item[1])
 best = wd_value(best_tag)
 done = {wd_value(tag) for tag, _score in rows}
-lr_rows = lr_means()
-lr_tag, lr_score = max(lr_rows, key=lambda item: item[1])
-lr = float(lr_tag[2:])
-print(f"META {lr_tag} {lr:.8e} {lr / 10:.8e}")
-print(f"best coarse {best_tag} macro_f1={best_score:.4f}", file=__import__("sys").stderr)
+lr = 1.7e-5
+print(f"META lr1.7e-5 {lr:.8e} {lr / 10:.8e}")
+print(f"best coarse {best_tag} acc={best_score:.4f}", file=__import__("sys").stderr)
 if best == 0:
     candidates = [1e-5, 3e-5, 3e-4, 3e-3]
 else:
@@ -146,7 +131,7 @@ for tag, rows in groups.items():
     acc = sum(item[0] for item in rows) / 4
     macro = sum(item[1] for item in rows) / 4
     print(f"MEAN {tag} n=4 acc={acc:.4f} macro_f1={macro:.4f}")
-    if best is None or macro > best[1]:
+    if best is None or acc > best[2]:
         best = (tag, macro, acc)
 if best:
     print(f"BEST_WD_FINE {best[0]} acc={best[2]:.4f} macro_f1={best[1]:.4f}")

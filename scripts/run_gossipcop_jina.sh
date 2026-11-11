@@ -1,8 +1,8 @@
 #!/bin/bash
 # LoopFuse on jina-clip-v1 for GossipCop.
-# Text window 2048. Two 3090s. Microbatch starts at 2 and doubles the
-# accumulation if that OOMs, so the global batch stays 32
-# (2 GPUs x micro 2 x accum 8).
+# Text window 2048. Four 4090s. Learning rate 2e-5.
+# Global batch stays 32: microbatch starts at 2 and accumulation is
+# 32 / (GPUs x micro). An OOM halves the microbatch and doubles accumulation.
 set -uo pipefail
 cd /home/yxfeng/cscwd27_loopfuse
 mkdir -p logs outputs/gossipcop_jina
@@ -19,7 +19,7 @@ export https_proxy="${https_proxy:-http://192.168.102.101:7890}"
 export HF_HUB_DISABLE_XET=1
 
 PY=/home/yxfeng/miniconda3/envs/www27/bin/python
-NPROC="${NPROC:-2}"
+NPROC="${NPROC:-4}"
 SUMMARY=logs/gossipcop_jina.log
 echo "START $(date) nproc=${NPROC} host=$(hostname)" | tee "$SUMMARY"
 
@@ -41,9 +41,13 @@ run_attempt() {
 }
 
 fail=0
+if [ $((32 % NPROC)) -ne 0 ]; then
+  echo "NPROC=${NPROC} does not divide global batch 32" | tee -a "$SUMMARY"
+  exit 1
+fi
 for seed in 0 1 2 3; do
   micro=2
-  accum=8
+  accum=$((32 / NPROC / micro))
   while true; do
     log="logs/gossipcop_jina_seed${seed}_m${micro}.log"
     echo "===== jina seed=${seed} micro=${micro} accum=${accum} $(date) =====" | tee -a "$SUMMARY"

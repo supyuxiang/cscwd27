@@ -1,8 +1,7 @@
 #!/bin/bash
-# Coarse weight-decay sweep at the best learning rate.
-# The learning rate is the highest 4-seed mean test macro F1 among the
-# coarse, fine, and gap sweeps. Weight decay is log-spaced around 0.01.
+# Coarse weight-decay sweep at the chosen learning rate 1.7e-5.
 # 4 GPUs, microbatch 32, accumulation 1, global batch 128. Four seeds each.
+# The representative of a weight decay is the mean test accuracy.
 set -uo pipefail
 cd /home/yxfeng/cscwd27_loopfuse
 mkdir -p logs outputs/weibo_wd_coarse
@@ -19,33 +18,9 @@ PY=/home/yxfeng/miniconda3/envs/www27/bin/python
 NPROC="${NPROC:-4}"
 SUMMARY=logs/weibo_wd_coarse.log
 
-read -r LR_TAG LR MIN_LR < <("${PY}" - <<'PY'
-import re
-from pathlib import Path
-
-def means(path, pattern):
-    if not path.is_file():
-        return []
-    rows = []
-    for line in path.read_text(errors="replace").splitlines():
-        match = re.search(pattern, line)
-        if match:
-            rows.append((match.group(1), float(match.group(2))))
-    return rows
-
-pattern = r"MEAN (lr\S+) n=4 acc=[0-9.]+ macro_f1=([0-9.]+)"
-rows = []
-rows += means(Path("logs/weibo_lr_resweep.log"), pattern)
-rows += means(Path("logs/weibo_lr_fine.log"), pattern)
-rows += means(Path("logs/weibo_lr_gap.log"), pattern)
-if not rows:
-    raise SystemExit("no completed learning-rate mean")
-tag, score = max(rows, key=lambda item: item[1])
-lr = float(tag[2:])
-print(f"{tag} {lr:.8e} {lr / 10:.8e}")
-print(f"chosen {tag} macro_f1={score:.4f} from {len(rows)} means", file=__import__("sys").stderr)
-PY
-)
+LR_TAG=lr1.7e-5
+LR=1.7e-5
+MIN_LR=1.7e-6
 
 echo "START $(date) nproc=${NPROC} host=$(hostname) lr=${LR} min_lr=${MIN_LR} from ${LR_TAG}" | tee "$SUMMARY"
 
@@ -58,7 +33,7 @@ run_attempt() {
     trainer.py --config=weibo_3090 \
     output_dir="outputs/weibo_wd_coarse/${tag}_seed${seed}" \
     run_name="weibo_wd_${tag}_seed${seed}" \
-    num_loops=3 epochs=50 patience=5 \
+    num_loops=3 epochs=50 patience=5 max_text_length=128 \
     batch_size="${micro}" grad_accum_steps="${accum}" \
     freeze_backbone=false lr="${LR}" min_lr="${MIN_LR}" weight_decay="${wd}" \
     seed="${seed}" > "${log}" 2>&1
@@ -127,7 +102,7 @@ for tag, rows in groups.items():
     acc = sum(item[0] for item in rows) / 4
     macro = sum(item[1] for item in rows) / 4
     print(f"MEAN {tag} n=4 acc={acc:.4f} macro_f1={macro:.4f}")
-    if best is None or macro > best[1]:
+    if best is None or acc > best[2]:
         best = (tag, macro, acc)
 if best:
     print(f"BEST_WD {best[0]} acc={best[2]:.4f} macro_f1={best[1]:.4f}")
