@@ -46,7 +46,7 @@ if [ $((32 % NPROC)) -ne 0 ]; then
   exit 1
 fi
 for seed in 0 1 2 3; do
-  micro=2
+  micro=1
   accum=$((32 / NPROC / micro))
   while true; do
     log="logs/gossipcop_jina_seed${seed}_m${micro}.log"

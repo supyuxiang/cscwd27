@@ -183,8 +183,8 @@ class Fuse(nn.Module):
         self.ln_v_t = nn.LayerNorm(embed_dim)
 
     def forward(self, out_ls_t, out_ls_v) -> tuple[torch.Tensor, torch.Tensor]:
-        text = _stack_loop_features(out_ls_t)
-        vision = _stack_loop_features(out_ls_v)
+        text: torch.Tensor = _stack_loop_features(out_ls_t)
+        vision: torch.Tensor = _stack_loop_features(out_ls_v)
         if text.size(-1) != self.embed_dim or vision.size(-1) != self.embed_dim:
             raise ValueError(
                 f"Fuse expected embed_dim={self.embed_dim}, got text {tuple(text.shape)} and vision {tuple(vision.shape)}."

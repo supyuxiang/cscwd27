@@ -113,6 +113,9 @@ class Fuse(nn.Module):
     def forward(self, out_ls_t, out_ls_v) -> tuple[torch.Tensor, torch.Tensor]:
         text = _stack_loop_features(out_ls_t)
         vision = _stack_loop_features(out_ls_v)
+        dtype = self.ln_t_v.weight.dtype
+        text = text.to(dtype=dtype)
+        vision = vision.to(dtype=dtype)
         if text.size(-1) != self.embed_dim or vision.size(-1) != self.embed_dim:
             raise ValueError(
                 f"Fuse expected embed_dim={self.embed_dim}, got text {tuple(text.shape)} and vision {tuple(vision.shape)}."
@@ -162,6 +165,15 @@ class LoopFuse(nn.Module):
             self.vision_model._loopfuse_rope_forward = rope.forward
         self.processor = AutoProcessor.from_pretrained(clip_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
+        self._contiguous_parameters()
+
+    def _contiguous_parameters(self) -> None:
+        for module in self.modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                if param.is_contiguous():
+                    continue
+                replacement = nn.Parameter(param.detach().contiguous(), requires_grad=param.requires_grad)
+                setattr(module, name, replacement)
 
     def _loop_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_loops: int) -> list[torch.Tensor]:
         transformer = self.text_model.transformer
@@ -174,7 +186,11 @@ class LoopFuse(nn.Module):
             keep = keep.long()
         outputs = []
         for _ in range(num_loops):
-            sequence = transformer.encoder(hidden_states, key_padding_mask=keep)
+            sequence = torch.utils.checkpoint.checkpoint(
+                lambda hidden, mask=keep: transformer.encoder(hidden, key_padding_mask=mask),
+                hidden_states,
+                use_reentrant=False,
+            )
             pooled = self.text_model.pooler(BaseModelOutput(last_hidden_state=sequence), keep)
             outputs.append(self.text_projection(self.text_model.proj(pooled)))
             hidden_states = sequence
@@ -202,10 +218,16 @@ class LoopFuse(nn.Module):
             hidden_states = vision.patch_dropout(hidden_states)
         rel_pos_bias = vision.rel_pos_bias() if vision.rel_pos_bias is not None else None
         outputs = []
+        blocks = vision.blocks
+        bias = rel_pos_bias
+
+        def _run_blocks(tokens):
+            for block in blocks:
+                tokens = block(tokens, rel_pos_bias=bias)
+            return tokens
+
         for _ in range(num_loops):
-            tokens = hidden_states
-            for block in vision.blocks:
-                tokens = block(tokens, rel_pos_bias=rel_pos_bias)
+            tokens = torch.utils.checkpoint.checkpoint(_run_blocks, hidden_states, use_reentrant=False)
             pooled_tokens = vision.norm(tokens)
             if vision.fc_norm is not None:
                 pooled = vision.fc_norm(pooled_tokens.mean(dim=1))

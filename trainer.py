@@ -143,6 +143,8 @@ class LoopFuseTrainer:
                 model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=False,
             )
         if self.is_main:
             total = sum(parameter.numel() for parameter in model.parameters())
