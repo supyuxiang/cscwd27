@@ -77,9 +77,11 @@ class LoopFuseDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         last_error: Exception | None = None
         for shift in range(len(self.samples)):
-            sample = self.samples[(index + shift) % len(self.samples)]
+            sample = self.samples[
+                (index + shift) % len(self.samples)
+            ]
             try:
-                image = Image.open(sample["image"]).convert("RGB")
+                image = Image.open(sample['image']).convert('RGB')
             except OSError as exc:
                 last_error = exc
                 continue
@@ -93,7 +95,8 @@ class LoopFuseDataset(Dataset):
 
 
 def loopfuse_collator(processor, max_length: int):
-    def collate(batch: list[dict]) -> dict:
+
+    def collate_fn(batch: list[dict]) -> dict:
         texts = [(sample["text"] or "").strip() or "." for sample in batch]
         encoded = processor(
             text=texts,
@@ -106,7 +109,7 @@ def loopfuse_collator(processor, max_length: int):
         encoded["labels"] = torch.tensor([int(sample["label"]) for sample in batch], dtype=torch.long)
         return encoded
 
-    return collate
+    return collate_fn
 
 
 def test():
