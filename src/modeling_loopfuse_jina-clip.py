@@ -15,6 +15,22 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+import transformers.models.clip.modeling_clip as clip_modeling
+
+
+def _install_clip_loss() -> None:
+    """transformers 5 removed clip_loss; jina-clip-v1 still imports it."""
+    if hasattr(clip_modeling, "clip_loss"):
+        return
+
+    def clip_loss(logits: torch.Tensor) -> torch.Tensor:
+        target = torch.arange(logits.shape[0], device=logits.device)
+        return (F.cross_entropy(logits, target) + F.cross_entropy(logits.t(), target)) / 2
+
+    clip_modeling.clip_loss = clip_loss
+
+
+_install_clip_loss()
 
 
 class GQA(nn.Module):
