@@ -4,6 +4,12 @@ The text tower is JinaBERT (ALiBi, mean pooling). The vision tower is EVA02
 ViT-B/16 (RoPE, CLS pooling). Both towers are embedded once and then the full
 encoder is reapplied with shared weights. Pooled states are projected with the
 checkpoint's own projections and fused across loops.
+
+Each later loop keeps that first embedding as its base. A scalar gate,
+initialized at zero, mixes in the normalized previous hidden state. With the
+gate closed, every loop sees the same input as the first pass. The fusion
+head adds a learned loop position, keeps the first-loop feature for the
+classifier, and starts as an identity around attention and the feed-forward.
 """
 
 from __future__ import annotations
@@ -32,6 +38,23 @@ def _install_clip_loss() -> None:
 
 _install_clip_loss()
 
+MAX_LOOPS = 16
+
+
+def _gated_reentry(original: torch.Tensor, previous: torch.Tensor, norm: nn.LayerNorm, gate: torch.Tensor) -> torch.Tensor:
+    """original + gate * (norm(previous) - original). Gate 0 leaves original unchanged."""
+    return original + gate * (norm(previous) - original)
+
+
+def _embedding_width(module: nn.Module) -> int:
+    for child in module.modules():
+        if isinstance(child, nn.Embedding):
+            return int(child.embedding_dim)
+    for child in module.modules():
+        if isinstance(child, nn.LayerNorm):
+            return int(child.normalized_shape[0])
+    raise RuntimeError("Cannot infer the hidden size used for loop reentry.")
+
 
 class GQA(nn.Module):
     def __init__(self, d_model: int, num_heads_q: int, num_heads_kv: int):
@@ -48,6 +71,8 @@ class GQA(nn.Module):
         self.wk = nn.Linear(d_model, self.d_k * num_heads_kv, bias=False)
         self.wv = nn.Linear(d_model, self.d_k * num_heads_kv, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.wo.weight)
+        nn.init.zeros_(self.wo.bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None) -> torch.Tensor:
         bsz, seq_len_q, seq_len_kv = q.size(0), q.size(1), k.size(1)
@@ -67,6 +92,8 @@ class FFN(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ffn)
         self.activation = nn.ReLU()
         self.fc2 = nn.Linear(d_ffn, d_model)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
         self.dropout = nn.Dropout(dropout_p)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -103,12 +130,18 @@ class Fuse(nn.Module):
     def __init__(self, embed_dim: int, num_heads_q: int, num_heads_kv: int, dropout_p: float = 0.1):
         super().__init__()
         self.embed_dim = embed_dim
+        self.loop_pos = nn.Parameter(torch.zeros(MAX_LOOPS, embed_dim))
+        nn.init.normal_(self.loop_pos, std=0.02)
         self.gqa_t_v = GQA(embed_dim, num_heads_q, num_heads_kv)
         self.gqa_v_t = GQA(embed_dim, num_heads_q, num_heads_kv)
         self.ffn_t_v = FFN(embed_dim, 4 * embed_dim, dropout_p)
         self.ffn_v_t = FFN(embed_dim, 4 * embed_dim, dropout_p)
         self.ln_t_v = nn.LayerNorm(embed_dim)
         self.ln_v_t = nn.LayerNorm(embed_dim)
+
+    def _mix(self, query: torch.Tensor, key: torch.Tensor, gqa: GQA, ffn: FFN, norm: nn.LayerNorm) -> torch.Tensor:
+        attended = query + gqa(query, key, key)
+        return attended + ffn(norm(attended))
 
     def forward(self, out_ls_t, out_ls_v) -> tuple[torch.Tensor, torch.Tensor]:
         text = _stack_loop_features(out_ls_t)
@@ -120,9 +153,17 @@ class Fuse(nn.Module):
             raise ValueError(
                 f"Fuse expected embed_dim={self.embed_dim}, got text {tuple(text.shape)} and vision {tuple(vision.shape)}."
             )
-        text_out = self.ffn_t_v(self.ln_t_v(self.gqa_t_v(text, vision, vision)))
-        vision_out = self.ffn_v_t(self.ln_v_t(self.gqa_v_t(vision, text, text)))
-        return text_out[:, -1], vision_out[:, -1]
+        n_loops = text.size(1)
+        if n_loops > MAX_LOOPS or vision.size(1) != n_loops:
+            raise ValueError(f"Fuse supports 1..{MAX_LOOPS} loops, got text {text.size(1)} and vision {vision.size(1)}.")
+        text_first = text[:, 0]
+        vision_first = vision[:, 0]
+        loop_pos = self.loop_pos[:n_loops].to(dtype=dtype).unsqueeze(0)
+        text = text + loop_pos
+        vision = vision + loop_pos
+        text_out = self._mix(text, vision, self.gqa_t_v, self.ffn_t_v, self.ln_t_v)
+        vision_out = self._mix(vision, text, self.gqa_v_t, self.ffn_v_t, self.ln_v_t)
+        return torch.cat([text_first, text_out[:, -1]], dim=-1), torch.cat([vision_first, vision_out[:, -1]], dim=-1)
 
 
 class LoopFuse(nn.Module):
@@ -139,7 +180,7 @@ class LoopFuse(nn.Module):
         self._load_looped_models(clip_path)
         self.fuse = Fuse(self.projection_dim, num_heads_q, num_heads_kv, dropout_p)
         self.classifier = nn.Sequential(
-            nn.Linear(self.projection_dim * 2, self.projection_dim),
+            nn.Linear(self.projection_dim * 4, self.projection_dim),
             nn.ReLU(),
             nn.Dropout(dropout_p),
             nn.Linear(self.projection_dim, num_classes),
@@ -163,6 +204,12 @@ class LoopFuse(nn.Module):
         rope = getattr(self.vision_model, "rope", None)
         if rope is not None:
             self.vision_model._loopfuse_rope_forward = rope.forward
+        text_width = _embedding_width(self.text_model.transformer.embeddings)
+        vision_width = int(self.vision_model.cls_token.shape[-1])
+        self.text_loop_gate = nn.Parameter(torch.zeros(1))
+        self.text_reentry_norm = nn.LayerNorm(text_width)
+        self.vision_loop_gate = nn.Parameter(torch.zeros(1))
+        self.vision_reentry_norm = nn.LayerNorm(vision_width)
         self.processor = AutoProcessor.from_pretrained(clip_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
         self._contiguous_parameters()
@@ -177,23 +224,30 @@ class LoopFuse(nn.Module):
 
     def _loop_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_loops: int) -> list[torch.Tensor]:
         transformer = self.text_model.transformer
-        hidden_states = transformer.embeddings(input_ids)
+        original = transformer.embeddings(input_ids)
         if not transformer.fused_dropout_add_ln:
-            hidden_states = transformer.emb_ln(hidden_states)
-        hidden_states = transformer.emb_drop(hidden_states)
+            original = transformer.emb_ln(original)
+        original = transformer.emb_drop(original)
         keep = attention_mask
         if keep.dtype != torch.long:
             keep = keep.long()
+        hidden_states = original
         outputs = []
-        for _ in range(num_loops):
+        for step in range(num_loops):
             sequence = torch.utils.checkpoint.checkpoint(
                 lambda hidden, mask=keep: transformer.encoder(hidden, key_padding_mask=mask),
                 hidden_states,
                 use_reentrant=False,
             )
-            pooled = self.text_model.pooler(BaseModelOutput(last_hidden_state=sequence), keep)
-            outputs.append(self.text_projection(self.text_model.proj(pooled)))
-            hidden_states = sequence
+            pooled = self.text_model.proj(self.text_model.pooler(BaseModelOutput(last_hidden_state=sequence), keep))
+            hidden_states = _gated_reentry(original, sequence, self.text_reentry_norm, self.text_loop_gate)
+            # The reentry is only consumed by the next loop. On the last step the
+            # added term is exactly zero, so the pooled value is unchanged, but the
+            # gate and reentry norm stay in the loss graph. One-loop DDP otherwise
+            # reports them as unused parameters.
+            if step == num_loops - 1:
+                pooled = pooled + (hidden_states - original).sum() * 0
+            outputs.append(self.text_projection(pooled))
         return outputs
 
     def _loop_vision(self, pixel_values: torch.Tensor, num_loops: int) -> list[torch.Tensor]:
@@ -217,6 +271,7 @@ class LoopFuse(nn.Module):
         else:
             hidden_states = vision.patch_dropout(hidden_states)
         rel_pos_bias = vision.rel_pos_bias() if vision.rel_pos_bias is not None else None
+        original = hidden_states
         outputs = []
         blocks = vision.blocks
         bias = rel_pos_bias
@@ -226,15 +281,21 @@ class LoopFuse(nn.Module):
                 tokens = block(tokens, rel_pos_bias=bias)
             return tokens
 
-        for _ in range(num_loops):
+        for step in range(num_loops):
             tokens = torch.utils.checkpoint.checkpoint(_run_blocks, hidden_states, use_reentrant=False)
             pooled_tokens = vision.norm(tokens)
             if vision.fc_norm is not None:
                 pooled = vision.fc_norm(pooled_tokens.mean(dim=1))
             else:
                 pooled = pooled_tokens[:, 0]
+            hidden_states = _gated_reentry(original, tokens, self.vision_reentry_norm, self.vision_loop_gate)
+            # The reentry is only consumed by the next loop. On the last step the
+            # added term is exactly zero, so the pooled value is unchanged, but the
+            # gate and reentry norm stay in the loss graph. One-loop DDP otherwise
+            # reports them as unused parameters.
+            if step == num_loops - 1:
+                pooled = pooled + (hidden_states - original).sum() * 0
             outputs.append(self.visual_projection(vision.head(pooled)))
-            hidden_states = tokens
         return outputs
 
     def forward(

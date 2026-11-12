@@ -1017,16 +1017,23 @@ class CLIPForImageClassification(CLIPPreTrainedModel):
 
 
 
+MAX_LOOPS = 16
+
+
+def _gated_reentry(original: torch.Tensor, previous: torch.Tensor, norm: nn.LayerNorm, gate: torch.Tensor) -> torch.Tensor:
+    """original + gate * (norm(previous) - original). Gate 0 leaves original unchanged."""
+    return original + gate * (norm(previous) - original)
+
+
 class LoopedCLIPTextModel(CLIPTextModel):
     def __init__(
         self,
         config: CLIPTextConfig,
     ):
         super().__init__(config)
+        self.loop_gate = nn.Parameter(torch.zeros(1))
+        self.reentry_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        # self.embedding
-        # self.encoder
-    
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1040,24 +1047,26 @@ class LoopedCLIPTextModel(CLIPTextModel):
         # position_ids: bsz, seq_len
         if input_ids is None:
             raise ValueError("You have to specify input_ids")
+        if num_loops < 1:
+            raise ValueError(f"num_loops must be positive, got {num_loops}.")
 
         input_shape = input_ids.size()
         input_ids = input_ids.view(-1, input_shape[-1])
 
-        hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
+        original = self.embeddings(input_ids=input_ids, position_ids=position_ids)
 
         attention_mask = create_causal_mask(
             config=self.config,
-            inputs_embeds=hidden_states,
+            inputs_embeds=original,
             attention_mask=attention_mask,
             past_key_values=None,
         )
 
         kwargs.pop("is_causal", None)
 
+        hidden_states = original
         out_ls = []
-        for _ in range(num_loops):
-            
+        for step in range(num_loops):
             encoder_outputs: BaseModelOutput = self.encoder(
                 inputs_embeds=hidden_states,
                 attention_mask=attention_mask,
@@ -1065,8 +1074,8 @@ class LoopedCLIPTextModel(CLIPTextModel):
                 **kwargs,
             )
 
-            last_hidden_state = encoder_outputs.last_hidden_state
-            last_hidden_state = self.final_layer_norm(last_hidden_state)
+            encoder_state = encoder_outputs.last_hidden_state
+            last_hidden_state = self.final_layer_norm(encoder_state)
 
             if self.eos_token_id == 2:
                 # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
@@ -1089,15 +1098,21 @@ class LoopedCLIPTextModel(CLIPTextModel):
                     .int()
                     .argmax(dim=-1),
                 ]
-            
+
+            hidden_states = _gated_reentry(original, encoder_state, self.reentry_norm, self.loop_gate)
+            # The reentry is only consumed by the next loop. On the last step the
+            # added term is exactly zero, so the pooled value is unchanged, but the
+            # gate and reentry norm stay in the loss graph. One-loop DDP otherwise
+            # reports them as unused parameters.
+            if step == num_loops - 1:
+                pooled_output = pooled_output + (hidden_states - original).sum() * 0
+
             out_ls.append(
                 BaseModelOutputWithPooling(
                     last_hidden_state=last_hidden_state,
                     pooler_output=pooled_output,
                 )
             )
-
-            hidden_states = last_hidden_state # bsz, seq_len, text_hidden
 
         return out_ls
 
@@ -1108,7 +1123,9 @@ class LoopedCLIPVisionModel(CLIPVisionModel):
         config: CLIPVisionConfig,
     ):
         super().__init__(config)
-    
+        self.loop_gate = nn.Parameter(torch.zeros(1))
+        self.reentry_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
     def forward(
         self,
         pixel_values: torch.FloatTensor | None = None,
@@ -1116,19 +1133,28 @@ class LoopedCLIPVisionModel(CLIPVisionModel):
         num_loops: int=3,
         **kwargs: Unpack[TransformersKwargs],
     ) -> list[BaseModelOutputWithPooling]:
-        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
-        hidden_states = self.pre_layrnorm(hidden_states)
+        if num_loops < 1:
+            raise ValueError(f"num_loops must be positive, got {num_loops}.")
+        original = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        original = self.pre_layrnorm(original)
 
+        hidden_states = original
         out_ls = []
-        for _ in range(num_loops):
+        for step in range(num_loops):
             encoder_outputs: BaseModelOutput = self.encoder(
                 inputs_embeds=hidden_states,
                 **kwargs,
             )
 
             last_hidden_state = encoder_outputs.last_hidden_state
-            pooled_output = last_hidden_state[:, 0, :]
-            pooled_output = self.post_layernorm(pooled_output)
+            pooled_output = self.post_layernorm(last_hidden_state[:, 0, :])
+            hidden_states = _gated_reentry(original, last_hidden_state, self.reentry_norm, self.loop_gate)
+            # The reentry is only consumed by the next loop. On the last step the
+            # added term is exactly zero, so the pooled value is unchanged, but the
+            # gate and reentry norm stay in the loss graph. One-loop DDP otherwise
+            # reports them as unused parameters.
+            if step == num_loops - 1:
+                pooled_output = pooled_output + (hidden_states - original).sum() * 0
 
             out_ls.append(
                 BaseModelOutputWithPooling(
@@ -1137,8 +1163,6 @@ class LoopedCLIPVisionModel(CLIPVisionModel):
                 )
             )
 
-            hidden_states = last_hidden_state # bsz, seq_len, vision_hidden
-            
         return out_ls
 
 
@@ -1164,6 +1188,8 @@ class GQA(nn.Module):
         self.wk = nn.Linear(d_model, self.d_k * self.num_heads_kv, bias=False)
         self.wv = nn.Linear(d_model, self.d_k * self.num_heads_kv, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.wo.weight)
+        nn.init.zeros_(self.wo.bias)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,mask=None) -> torch.Tensor:
         # x: batch_size, seq_len ,d_model
@@ -1215,6 +1241,8 @@ class FFN(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ffn)
         self.activation = nn.ReLU()
         self.fc2 = nn.Linear(d_ffn, d_model)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
         self.dropout = nn.Dropout(dropout_p)
     
     def forward(self, x: torch.Tensor):
@@ -1339,6 +1367,8 @@ class Fuse(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads_q = num_heads_q
         self.num_heads_kv = num_heads_kv
+        self.loop_pos = nn.Parameter(torch.zeros(MAX_LOOPS, embed_dim))
+        nn.init.normal_(self.loop_pos, std=0.02)
 
         self.gqa_t_v = GQA(
             d_model=embed_dim,
@@ -1371,6 +1401,9 @@ class Fuse(nn.Module):
         nn.init.ones_(self.ln_v_t.weight)
         nn.init.zeros_(self.ln_v_t.bias)
 
+    def _mix(self, query: torch.Tensor, key: torch.Tensor, gqa: GQA, ffn: FFN, norm: nn.LayerNorm) -> torch.Tensor:
+        attended = query + gqa(query, key, key)
+        return attended + ffn(norm(attended))
 
     def forward(
         self,
@@ -1384,28 +1417,17 @@ class Fuse(nn.Module):
             raise ValueError(
                 f"Fuse expected embed_dim={self.embed_dim}, got text {tuple(t.shape)} and vision {tuple(v.shape)}."
             )
-
-        # cross-attention t_to_v
-        attn_t_v = self.gqa_t_v(
-            q=t, k=v, v=v, mask=None
-        ) # bsz, num_loops, embed_dim
-        norm_t_v = self.ln_t_v(attn_t_v)
-        ffn_t_v = self.ffn_t_v(
-            norm_t_v
-        ) # bsz, num_loops, embed_dim
-        feature_t_v = ffn_t_v[:,-1] # bsz, embed_dim
-
-        # cross-attention v_to_t
-        attn_v_t = self.gqa_v_t(
-            q=v,k=t,v=t, mask=None
-        ) # bsz, num_loops, embed_dim
-        norm_v_t = self.ln_v_t(attn_v_t)
-        ffn_v_t = self.ffn_v_t(
-            norm_v_t
-        ) # bsz, num_loops, embed_dim
-        feature_v_t = ffn_v_t[:,-1] # bsz, embed_dim
-
-        return feature_t_v, feature_v_t
+        n_loops = t.size(1)
+        if n_loops > MAX_LOOPS or v.size(1) != n_loops:
+            raise ValueError(f"Fuse supports 1..{MAX_LOOPS} loops, got text {t.size(1)} and vision {v.size(1)}.")
+        text_first = t[:, 0]
+        vision_first = v[:, 0]
+        loop_pos = self.loop_pos[:n_loops].unsqueeze(0)
+        t = t + loop_pos
+        v = v + loop_pos
+        text_out = self._mix(t, v, self.gqa_t_v, self.ffn_t_v, self.ln_t_v)
+        vision_out = self._mix(v, t, self.gqa_v_t, self.ffn_v_t, self.ln_v_t)
+        return torch.cat([text_first, text_out[:, -1]], dim=-1), torch.cat([vision_first, vision_out[:, -1]], dim=-1)
 
 
 
@@ -1428,7 +1450,7 @@ class LoopFuse(nn.Module):
             dropout_p=dropout_p,
         )
         self.classifier = nn.Sequential(
-            nn.Linear(self.projection_dim * 2, self.projection_dim),
+            nn.Linear(self.projection_dim * 4, self.projection_dim),
             nn.ReLU(),
             nn.Dropout(dropout_p),
             nn.Linear(self.projection_dim, num_classes),
@@ -1447,8 +1469,18 @@ class LoopFuse(nn.Module):
 
         self.text_encoder = LoopedCLIPTextModel(config.text_config)
         self.vision_encoder = LoopedCLIPVisionModel(config.vision_config)
-        self.text_encoder.load_state_dict(_encoder_weights(state_dict, "text_model"), strict=True)
-        self.vision_encoder.load_state_dict(_encoder_weights(state_dict, "vision_model"), strict=True)
+        text_missing, text_unexpected = self.text_encoder.load_state_dict(
+            _encoder_weights(state_dict, "text_model"), strict=False
+        )
+        vision_missing, vision_unexpected = self.vision_encoder.load_state_dict(
+            _encoder_weights(state_dict, "vision_model"), strict=False
+        )
+        new_keys = {"loop_gate", "reentry_norm.weight", "reentry_norm.bias"}
+        if text_unexpected or vision_unexpected or set(text_missing) - new_keys or set(vision_missing) - new_keys:
+            raise RuntimeError(
+                f"CLIP tower load mismatch. text missing={text_missing} unexpected={text_unexpected}; "
+                f"vision missing={vision_missing} unexpected={vision_unexpected}."
+            )
 
         self.text_hidden = int(config.text_config.hidden_size)
         self.vision_hidden = int(config.vision_config.hidden_size)

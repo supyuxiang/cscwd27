@@ -336,11 +336,19 @@ class _SinglePass(nn.Module):
 
 
 class CLIPConcat(_SinglePass):
-    """One pass, concatenate the two projected vectors, same MLP width as LoopFuse."""
+    """One pass, concatenate the two projected vectors."""
 
     def __init__(self, config: dict, backbone: str):
         super().__init__(config, backbone, "clip_concat")
         self.fuse = nn.Identity()
+        dropout_p = float(config.get("dropout", 0.1))
+        width = self.projection_dim
+        self.classifier = nn.Sequential(
+            nn.Linear(width * 2, width),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(width, int(config.get("num_classes", 2))),
+        )
 
     def forward(self, input_ids, attention_mask, pixel_values, num_loops: int = 1, **kwargs):
         text, vision = self._encode(input_ids, attention_mask, pixel_values)

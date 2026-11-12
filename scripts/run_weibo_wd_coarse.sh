@@ -33,7 +33,7 @@ run_attempt() {
     trainer.py --config=weibo_3090 \
     output_dir="outputs/weibo_wd_coarse/${tag}_seed${seed}" \
     run_name="weibo_wd_${tag}_seed${seed}" \
-    num_loops=3 epochs=50 patience=5 max_text_length=128 \
+    num_loops=3 epochs=50 patience=5 max_text_length=512 \
     batch_size="${micro}" grad_accum_steps="${accum}" \
     freeze_backbone=false lr="${LR}" min_lr="${MIN_LR}" weight_decay="${wd}" \
     seed="${seed}" > "${log}" 2>&1

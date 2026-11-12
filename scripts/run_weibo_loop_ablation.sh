@@ -35,7 +35,7 @@ run_attempt() {
     trainer.py --config=weibo_3090 \
     output_dir="outputs/weibo_loop_ablation/loop${loops}_seed${seed}" \
     run_name="weibo_loop${loops}_seed${seed}" \
-    num_loops="${loops}" epochs=50 patience=5 max_text_length=128 \
+    num_loops="${loops}" epochs=50 patience=5 max_text_length=512 \
     batch_size="${micro}" grad_accum_steps="${accum}" \
     freeze_backbone=false lr="${LR}" min_lr="${MIN_LR}" weight_decay="${WD}" \
     seed="${seed}" > "${log}" 2>&1

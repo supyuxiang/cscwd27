@@ -27,6 +27,11 @@ _NAMES = {
     "clip-concat": "clip_concat",
     "clip_interact": "clip_interact",
     "clip-interact": "clip_interact",
+    "loopback": "loopback",
+    "loopprobe": "loopprobe",
+    "directfuse": "directfuse",
+    "partial_loop": "partial_loop",
+    "randproj": "randproj",
 }
 
 
@@ -43,6 +48,51 @@ def build_detector(config: dict):
 
         model = _build_core(config, backbone)
         model.baseline_name = "loopfuse"
+        return model
+    if name == "loopback":
+        if backbone != "chinese":
+            raise ValueError("loopback is implemented for the Chinese CLIP backbone.")
+        from .models import _core_kwargs
+        from src.modeling_loopfuse_chinese import Loopback
+
+        model = Loopback(**_core_kwargs(config))
+        model.baseline_name = "loopback"
+        return model
+    if name == "loopprobe":
+        if backbone != "chinese":
+            raise ValueError("loopprobe is implemented for the Chinese CLIP backbone.")
+        from .models import _core_kwargs
+        from src.modeling_loopfuse_chinese import LoopProbe
+
+        model = LoopProbe(**_core_kwargs(config))
+        model.baseline_name = "loopprobe"
+        return model
+    if name == "directfuse":
+        if backbone != "chinese":
+            raise ValueError("directfuse is implemented for the Chinese CLIP backbone.")
+        from .models import _core_kwargs
+        from src.modeling_loopfuse_chinese import DirectFuse
+
+        model = DirectFuse(**_core_kwargs(config))
+        model.baseline_name = "directfuse"
+        return model
+    if name == "partial_loop":
+        if backbone != "chinese":
+            raise ValueError("partial_loop is implemented for the Chinese CLIP backbone.")
+        from .models import _core_kwargs
+        from src.modeling_loopfuse_chinese import LoopFuse_partial_loop
+
+        model = LoopFuse_partial_loop(**_core_kwargs(config))
+        model.baseline_name = "partial_loop"
+        return model
+    if name == "randproj":
+        if backbone != "chinese":
+            raise ValueError("randproj is implemented for the Chinese CLIP backbone.")
+        from .models import _core_kwargs
+        from src.modeling_loopfuse_chinese import LoopFuseRandProj
+
+        model = LoopFuseRandProj(**_core_kwargs(config))
+        model.baseline_name = "randproj"
         return model
 
     num_loops = int(config.get("num_loops", 3))

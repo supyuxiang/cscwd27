@@ -130,7 +130,7 @@ class LoopFuseTrainer:
         if forced is not None:
             self.num_loops = int(forced)
         frozen = bool(self.config.get("freeze_backbone", False))
-        trainable_when_frozen = ("fuse", "classifier", "text_projection", "visual_projection", "lora")
+        trainable_when_frozen = ("fuse", "classifier", "text_projection", "visual_projection", "lora", "mixer")
         for name, parameter in model.named_parameters():
             if frozen and not any(key in name for key in trainable_when_frozen):
                 parameter.requires_grad = False
@@ -156,11 +156,16 @@ class LoopFuseTrainer:
         return model
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
-            [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-            lr=float(self.config["lr"]),
-            weight_decay=float(self.config.get("weight_decay", 0.0)),
-        )
+        lr = float(self.config["lr"])
+        weight_decay = float(self.config.get("weight_decay", 0.0))
+        grouped = getattr(self._unwrap(), "optimizer_groups", None)
+        if grouped is None:
+            return torch.optim.AdamW(
+                [parameter for parameter in self.model.parameters() if parameter.requires_grad],
+                lr=lr,
+                weight_decay=weight_decay,
+            )
+        return torch.optim.AdamW(grouped(lr), weight_decay=weight_decay)
 
     def _build_scheduler(self):
         return torch.optim.lr_scheduler.CosineAnnealingLR(
