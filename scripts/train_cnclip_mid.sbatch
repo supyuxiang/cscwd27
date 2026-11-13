@@ -31,7 +31,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=4
 export MASTER_PORT=29831
 
-OUT=/data3/yxfeng/experiments/cnclip_midtrain_l2
+OUT=/data3/yxfeng/experiments/cnclip_midtrain_l2_gate
 mkdir -p "$OUT"
 TORCHRUN=/home/yxfeng/miniconda3/envs/www27/bin/torchrun
 DATA=/data3/yxfeng/datasets/cnclip_pretrain/jsonl
