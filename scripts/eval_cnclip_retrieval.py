@@ -235,6 +235,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clip", default="/data3/yxfeng/models/clip/chinese-clip-vit-base-patch16")
     parser.add_argument("--checkpoint", default="/data3/yxfeng/experiments/cnclip_midtrain_l2/step_5000.pt")
+    parser.add_argument("--skip-checkpoint", action="store_true", help="Keep the original Chinese CLIP weights and only change the forward to loop.")
     parser.add_argument("--flickr", default="/data3/yxfeng/datasets/flickr30k-cn/Flickr30k-CN")
     parser.add_argument("--jsonl", default="/data3/yxfeng/datasets/cnclip_pretrain/jsonl")
     parser.add_argument("--n", type=int, default=800)
@@ -262,14 +263,19 @@ def main() -> None:
     torch.cuda.empty_cache()
 
     student = LoopStudent(args.clip, num_heads_q=8, num_heads_kv=4, dropout_p=0.0).to(device).eval()
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    student.load_state_dict(checkpoint["model"])
-    print(f"checkpoint step {checkpoint.get('step')}", flush=True)
+    tag = "vanilla-loop"
+    if not args.skip_checkpoint:
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        student.load_state_dict(checkpoint["model"])
+        tag = "midtrain-loop"
+        print(f"checkpoint step {checkpoint.get('step')}", flush=True)
+    else:
+        print("loop towers initialized from Chinese CLIP, no mid-train checkpoint", flush=True)
     image_loops = embed_images_student(student, processor, pictures, args.batch_size, device, args.num_loops)
     text_loops = embed_texts_student(student, processor, texts, args.batch_size, args.max_length, device, args.num_loops)
     for index, (image_s, text_s) in enumerate(zip(image_loops, text_loops)):
         image_to_text, text_to_image_score = recall_retrieval(image_s, text_s, text_to_image, image_to_texts)
-        print(f"midtrain-loop{index:<4} I2T {image_to_text} T2I {text_to_image_score}", flush=True)
+        print(f"{tag}{index:<4} I2T {image_to_text} T2I {text_to_image_score}", flush=True)
 
 
 if __name__ == "__main__":
