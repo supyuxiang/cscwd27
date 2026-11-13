@@ -943,13 +943,13 @@ class LoopbackChineseCLIPTextModel_partial_loop(ChineseCLIPTextModel):
             attention_mask=attention_mask,
         )
         hidden_states = _run_layer_block(
-            self.encoder.layer,
-            hidden_states,
-            self.loop_start,
-            self.loop_end,
-            num_loops,
-            lambda layer, hidden: layer(hidden, attention_mask, **kwargs),
-            self.gate,
+            layers=self.encoder.layer, # nn.ModuleList
+            hidden_states=hidden_states,
+            start=self.loop_start,
+            end=self.loop_end,
+            num_loops= num_loops,
+            call=lambda layer, hidden: layer(hidden, attention_mask, **kwargs),
+            gate=self.gate,
             collect_each_loop=return_each_loop,
         )
         if return_each_loop:
@@ -980,12 +980,12 @@ class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
         hidden_states = self.pre_layrnorm(hidden_states)
         hidden_states = _run_layer_block(
-            self.encoder.layers,
-            hidden_states,
-            self.loop_start,
-            self.loop_end,
-            num_loops,
-            lambda layer, hidden: layer(hidden, None, **kwargs),
+            layers=self.encoder.layers,
+            hidden_states=hidden_states,
+            start=self.loop_start,
+            end=self.loop_end,
+            num_loops=num_loops,
+            call=lambda layer, hidden: layer(hidden, None, **kwargs),
             collect_each_loop=return_each_loop,
         )
         if return_each_loop:
