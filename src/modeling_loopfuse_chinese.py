@@ -20,10 +20,6 @@ from transformers.utils import TransformersKwargs
 MAX_LOOPS = 16
 
 
-# def _gated_reentry(original: torch.Tensor, previous: torch.Tensor, norm: nn.LayerNorm, gate: torch.Tensor) -> torch.Tensor:
-#     """original + gate * (norm(previous) - original). Gate 0 leaves original unchanged."""
-#     return original + gate * (norm(previous) - original)
-
 
 class LoopedChineseCLIPTextModel(ChineseCLIPTextModel):
     def __init__(self, config):
