@@ -20,12 +20,26 @@ NPROC="${NPROC:-4}"
 SPLIT="${SPLIT:-all}"
 SEEDS="${SEEDS:-0 1 2 3 4 5 6 7}"
 SUMMARY="logs/weibo_partial_gate_${SPLIT}.log"
-OUT=outputs/weibo_partial_gate
-LR=2e-5
-MIN_LR=2e-6
+OUT="${OUT:-outputs/weibo_partial_gate}"
+LR="${LR:-2e-5}"
+MIN_LR="${MIN_LR:-2e-6}"
 WD=1e-4
+MODEL_TYPE="${MODEL_TYPE:-partial_loop}"
+INIT_ARGS=""
+if [[ -n "${INIT_CKPT:-}" ]]; then
+  INIT_ARGS="+init_checkpoint=${INIT_CKPT}"
+fi
+if [[ "${EVAL_TEST_EACH_EPOCH:-}" == "1" ]]; then
+  INIT_ARGS="${INIT_ARGS:+${INIT_ARGS} }+eval_test_each_epoch=true"
+fi
+if [[ "${FREEZE_CLIP:-}" == "1" ]]; then
+  INIT_ARGS="${INIT_ARGS:+${INIT_ARGS} }+freeze_clip=true"
+fi
+if [[ "${LORA_CLIP:-}" == "1" ]]; then
+  INIT_ARGS="${INIT_ARGS:+${INIT_ARGS} }+lora_clip=true +lora_rank=${LORA_RANK:-8} +lora_alpha=${LORA_ALPHA:-8}"
+fi
 
-echo "START $(date) split=${SPLIT} seeds=${SEEDS} nproc=${NPROC} host=$(hostname) lr=${LR} min_lr=${MIN_LR} wd=${WD} batch=128 model=partial_loop" | tee "$SUMMARY"
+echo "START $(date) split=${SPLIT} seeds=${SEEDS} nproc=${NPROC} host=$(hostname) lr=${LR} min_lr=${MIN_LR} wd=${WD} batch=128 model=${MODEL_TYPE} freeze_clip=${FREEZE_CLIP:-0} lora_clip=${LORA_CLIP:-0} init=${INIT_CKPT:-none}" | tee "$SUMMARY"
 
 run_attempt() {
   local loops="$1" seed="$2" micro="$3" accum="$4" log="$5"
@@ -38,8 +52,8 @@ run_attempt() {
     run_name="weibo_partial_gate_seed${seed}" \
     num_loops="${loops}" epochs=50 patience=5 max_text_length=512 \
     batch_size="${micro}" grad_accum_steps="${accum}" \
-    model_type=partial_loop freeze_backbone=false lr="${LR}" min_lr="${MIN_LR}" weight_decay="${WD}" \
-    seed="${seed}" > "${log}" 2>&1
+    model_type="${MODEL_TYPE}" freeze_backbone=false lr="${LR}" min_lr="${MIN_LR}" weight_decay="${WD}" \
+    seed="${seed}" ${INIT_ARGS:-} > "${log}" 2>&1
 }
 
 seed_done() {
@@ -119,7 +133,7 @@ PY
 }
 
 fail=0
-for loops in 2; do
+for loops in ${LOOPS:-2}; do
   for seed in ${SEEDS}; do
     if seed_done "${loops}" "${seed}"; then
       echo "SKIP loop=${loops} seed=${seed} already recorded" | tee -a "$SUMMARY"
@@ -128,7 +142,7 @@ for loops in 2; do
     micro=32
     accum=1
     while true; do
-      log="logs/weibo_partial_gate_seed${seed}_m${micro}.log"
+      log="logs/${LOG_TAG:-weibo_partial_gate}_seed${seed}_m${micro}.log"
       echo "===== loop=${loops} seed=${seed} micro=${micro} accum=${accum} $(date) =====" | tee -a "$SUMMARY"
       rm -rf "${OUT}/loop${loops}_seed${seed}"
       status=0

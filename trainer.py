@@ -126,16 +126,45 @@ class LoopFuseTrainer:
         from baselines import build_detector
 
         model = build_detector(self.config)
+        self._load_init_checkpoint(model)
         forced = getattr(model, "forced_loops", None)
         if forced is not None:
             self.num_loops = int(forced)
         frozen = bool(self.config.get("freeze_backbone", False))
+        freeze_clip = self._as_bool(self.config.get("freeze_clip", False))
+        lora_clip = self._as_bool(self.config.get("lora_clip", False))
         trainable_when_frozen = ("fuse", "classifier", "text_projection", "visual_projection", "lora", "mixer")
         for name, parameter in model.named_parameters():
-            if frozen and not any(key in name for key in trainable_when_frozen):
+            if lora_clip:
+                parameter.requires_grad = self._is_lora_trainable(name)
+            elif freeze_clip:
+                parameter.requires_grad = self._is_non_clip_parameter(name)
+            elif frozen and not any(key in name for key in trainable_when_frozen):
                 parameter.requires_grad = False
             else:
                 parameter.requires_grad = True
+        if self.is_main and (freeze_clip or lora_clip):
+            groups: dict[str, int] = {}
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                if name.startswith("lora.") or ".lora." in name:
+                    key = "lora"
+                elif ".gate." in name or name.startswith("gate."):
+                    key = "gate"
+                else:
+                    key = name.split(".", 1)[0]
+                groups[key] = groups.get(key, 0) + parameter.numel()
+            detail = ", ".join(f"{key} {count}" for key, count in sorted(groups.items()))
+            label = "lora_clip" if lora_clip else "freeze_clip"
+            extra = ""
+            if lora_clip:
+                extra = (
+                    f" rank={getattr(model, 'lora_rank', '?')}"
+                    f" alpha={getattr(model, 'lora_alpha', '?')}"
+                    f" linears={getattr(model, 'lora_linear_count', '?')}"
+                )
+            print(f"{label} trainable: {detail}{extra}", flush=True)
         model.to(self.device)
         baseline = getattr(model, "baseline_name", model.__class__.__name__)
         if self.distributed:
@@ -154,6 +183,25 @@ class LoopFuseTrainer:
                 f"loops={self.num_loops}, deterministic=True, device={self.device}"
             )
         return model
+
+    def _load_init_checkpoint(self, model: torch.nn.Module) -> None:
+        path = str(self.config.get("init_checkpoint") or "").strip()
+        if not path:
+            return
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        source = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+        current = model.state_dict()
+        mapped = {}
+        skipped = []
+        for key, value in source.items():
+            name = key[7:] if key.startswith("module.") else key
+            if name in current and tuple(current[name].shape) == tuple(value.shape):
+                mapped[name] = value
+            else:
+                skipped.append(name)
+        model.load_state_dict(mapped, strict=False)
+        if self.is_main:
+            print(f"init_checkpoint {path} loaded {len(mapped)} tensors, skipped {len(skipped)}", flush=True)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         lr = float(self.config["lr"])
@@ -203,8 +251,50 @@ class LoopFuseTrainer:
             )
             return self.loss_fn(logits, batch["labels"])
 
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+        return bool(value)
+
+    @staticmethod
+    def _is_non_clip_parameter(name: str) -> bool:
+        return (
+            name.startswith("fuse.")
+            or name.startswith("classifier.")
+            or name.startswith("gate.")
+            or ".gate." in name
+        )
+
+    @staticmethod
+    def _is_lora_trainable(name: str) -> bool:
+        return (
+            name.startswith("lora.")
+            or ".lora." in name
+            or name.startswith("fuse.")
+            or name.startswith("classifier.")
+            or name.startswith("gate.")
+            or ".gate." in name
+        )
+
+    def _set_clip_eval(self) -> None:
+        frozen = self._as_bool(self.config.get("freeze_clip", False)) or self._as_bool(
+            self.config.get("lora_clip", False)
+        )
+        if not frozen:
+            return
+        raw = self._unwrap()
+        for name in ("text_encoder", "vision_encoder", "text_projection", "visual_projection"):
+            module = getattr(raw, name, None)
+            if module is not None:
+                module.eval()
+        gate = getattr(getattr(raw, "text_encoder", None), "gate", None)
+        if gate is not None:
+            gate.train()
+
     def _train_one_epoch(self, epoch: int) -> float:
         self.model.train()
+        self._set_clip_eval()
         if self.train_sampler is not None:
             self.train_sampler.set_epoch(epoch)
         self.optimizer.zero_grad(set_to_none=True)
@@ -270,6 +360,8 @@ class LoopFuseTrainer:
             if self.is_main:
                 message = f"epoch {epoch}/{self.epochs} loss {loss:.4f} lr {self.scheduler.get_last_lr()[0]:.2e}"
                 logged = {"train/loss": loss, "lr": self.scheduler.get_last_lr()[0]}
+                report = None
+                improved = False
                 if self.val_loader is not None:
                     metrics, report = self.evaluate(self.val_loader)
                     logged.update({f"val/{key}": value for key, value in metrics.items()})
@@ -280,17 +372,30 @@ class LoopFuseTrainer:
                     if metrics["macro_f1"] > best_score:
                         best_score = metrics["macro_f1"]
                         stale = 0
+                        improved = True
                         self._save("best.pt", epoch, metrics)
-                        print(message)
-                        print(report)
                     else:
                         stale += 1
                         if self.patience > 0:
                             message += f" stale {stale}/{self.patience}"
-                        print(message)
                     stop = self.patience > 0 and stale >= self.patience
-                else:
-                    print(message)
+                test_metrics = None
+                if self.config.get("eval_test_each_epoch") and self.test_loader is not None:
+                    test_metrics, _test_report = self.evaluate(self.test_loader)
+                    logged.update({f"test_epoch/{key}": value for key, value in test_metrics.items()})
+                    message += (
+                        f" test_acc {test_metrics['accuracy']:.4f}"
+                        f" test_macro_f1 {test_metrics['macro_f1']:.4f}"
+                    )
+                print(message, flush=True)
+                if improved and report is not None:
+                    print(report)
+                if test_metrics is not None:
+                    print(
+                        f"epoch {epoch} test "
+                        + " ".join(f"{key}={value:.4f}" for key, value in test_metrics.items()),
+                        flush=True,
+                    )
                 self.logger.log(logged, step=epoch)
                 self._save("last.pt", epoch, metrics)
             if self._should_stop(stop):

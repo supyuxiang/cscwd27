@@ -30,9 +30,17 @@ _NAMES = {
     "loopback": "loopback",
     "loopprobe": "loopprobe",
     "directfuse": "directfuse",
+    "decoder_loop": "decoder_loop",
+    "decoder-loop": "decoder_loop",
     "partial_loop": "partial_loop",
     "randproj": "randproj",
 }
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
 
 
 def build_detector(config: dict):
@@ -76,6 +84,15 @@ def build_detector(config: dict):
         model = DirectFuse(**_core_kwargs(config))
         model.baseline_name = "directfuse"
         return model
+    if name == "decoder_loop":
+        if backbone != "chinese":
+            raise ValueError("decoder_loop is implemented for the Chinese CLIP backbone.")
+        from .models import _core_kwargs
+        from src.modeling_loopfuse_chinese import DecoderLoop
+
+        model = DecoderLoop(**_core_kwargs(config))
+        model.baseline_name = "decoder_loop"
+        return model
     if name == "partial_loop":
         if backbone != "chinese":
             raise ValueError("partial_loop is implemented for the Chinese CLIP backbone.")
@@ -83,6 +100,18 @@ def build_detector(config: dict):
         from src.modeling_loopfuse_chinese import LoopFuse_partial_loop
 
         model = LoopFuse_partial_loop(**_core_kwargs(config))
+        if _as_bool(config.get("lora_clip", False)):
+            from baselines.lora import LoopLoRABank, attention_linears
+
+            rank = int(config.get("lora_rank", 8))
+            alpha = float(config.get("lora_alpha", rank))
+            linears = attention_linears(model.text_encoder, model.vision_encoder)
+            if not linears:
+                raise RuntimeError("lora_clip found no attention projections on the Chinese CLIP towers.")
+            model.lora = LoopLoRABank(linears, num_loops=1, rank=rank, alpha=alpha)
+            model.lora_linear_count = len(linears)
+            model.lora_rank = rank
+            model.lora_alpha = alpha
         model.baseline_name = "partial_loop"
         return model
     if name == "randproj":

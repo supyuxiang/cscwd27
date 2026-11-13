@@ -349,6 +349,53 @@ class PairFuse(nn.Module):
         return text_out[:, 0], vision_out[:, 0]
 
 
+class BothLoopFuse(nn.Module):
+    """Fuse both loops of text and vision.
+
+    The first linear maps concat(text loop1, text loop2, vision loop1, vision loop2)
+    from 4d to d. It starts as the mean of those four vectors. The two directions
+    then use the same residual GQA and FFN as PairFuse.
+    """
+
+    def __init__(self, embed_dim: int, num_heads_q: int, num_heads_kv: int, dropout_p: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.in_proj = nn.Linear(4 * embed_dim, embed_dim)
+        eye = torch.eye(embed_dim)
+        with torch.no_grad():
+            self.in_proj.weight.zero_()
+            self.in_proj.bias.zero_()
+            for index in range(4):
+                start = index * embed_dim
+                self.in_proj.weight[:, start:start + embed_dim] = eye / 4
+        self.gqa_t_v = GQA(embed_dim, num_heads_q, num_heads_kv)
+        self.gqa_v_t = GQA(embed_dim, num_heads_q, num_heads_kv)
+        self.ffn_t_v = FFN(embed_dim, 4 * embed_dim, dropout_p)
+        self.ffn_v_t = FFN(embed_dim, 4 * embed_dim, dropout_p)
+        self.ln_t_v = nn.LayerNorm(embed_dim)
+        self.ln_v_t = nn.LayerNorm(embed_dim)
+
+    def _mix(self, query: torch.Tensor, key: torch.Tensor, gqa: GQA, ffn: FFN, norm: nn.LayerNorm) -> torch.Tensor:
+        attended = query + gqa(query, key, key)
+        return attended + ffn(norm(attended))
+
+    def forward(self, text_loops: list[torch.Tensor], vision_loops: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(text_loops) != 2 or len(vision_loops) != 2:
+            raise ValueError(
+                f"BothLoopFuse expects 2 text and 2 vision loops, got {len(text_loops)} and {len(vision_loops)}."
+            )
+        features = [text_loops[0], text_loops[1], vision_loops[0], vision_loops[1]]
+        for tensor in features:
+            if tensor.size(-1) != self.embed_dim:
+                raise ValueError(
+                    f"BothLoopFuse expected embed_dim={self.embed_dim}, got {tuple(tensor.shape)}."
+                )
+        mixed = self.in_proj(torch.cat(features, dim=-1)).unsqueeze(1)
+        text_out = self._mix(mixed, mixed, self.gqa_t_v, self.ffn_t_v, self.ln_t_v)
+        vision_out = self._mix(mixed, mixed, self.gqa_v_t, self.ffn_v_t, self.ln_v_t)
+        return text_out[:, 0], vision_out[:, 0]
+
+
 class DirectFuse(nn.Module):
     """Fine-tune Chinese CLIP for one pass, fuse the two embeddings, then classify.
 
@@ -491,7 +538,7 @@ class LoopbackChineseCLIPTextModel_partial_loop(ChineseCLIPTextModel):
                 nn.init.zeros_(m.weight)
                 nn.init.zeros_(m.bias)
             
-
+    
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -538,7 +585,7 @@ class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
     def __init__(self, config):
         super().__init__(config)
         self.loop_start, self.loop_end = _middle_loop_span(len(self.encoder.layers))
-
+    
     def forward(
         self,
         pixel_values: torch.FloatTensor | None = None,
@@ -569,6 +616,7 @@ class LoopFuse_partial_loop(nn.Module):
     """DirectFuse, except the middle block is repeated as a whole.
 
     Text applies a zero-initialized per-token gate after each repetition.
+    Both loop readouts are projected and concatenated for BothLoopFuse.
     ``forced_loops`` keeps this run at 2.
     """
 
@@ -617,7 +665,7 @@ class LoopFuse_partial_loop(nn.Module):
             self.text_projection.weight.copy_(state_dict["text_projection.weight"])
             self.visual_projection.weight.copy_(state_dict["visual_projection.weight"])
 
-        self.fuse = PairFuse(self.projection_dim, num_heads_q, num_heads_kv, dropout_p)
+        self.fuse = BothLoopFuse(self.projection_dim, num_heads_q, num_heads_kv, dropout_p)
         self.classifier = nn.Sequential(
             nn.Linear(self.projection_dim * 2, self.projection_dim),
             nn.ReLU(),
@@ -642,13 +690,163 @@ class LoopFuse_partial_loop(nn.Module):
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             num_loops=num_loops,
+            return_each_loop=True,
         )
-        vision_out = self.vision_encoder(pixel_values=pixel_values, num_loops=num_loops)
-        text = self.text_projection(text_out[-1])
-        vision = self.visual_projection(vision_out[-1])
-        feature_t, feature_v = self.fuse(text, vision)
+        vision_out = self.vision_encoder(
+            pixel_values=pixel_values,
+            num_loops=num_loops,
+            return_each_loop=True,
+        )
+        text_loops = [self.text_projection(pooled) for pooled in text_out]
+        vision_loops = [self.visual_projection(pooled) for pooled in vision_out]
+        feature_t, feature_v = self.fuse(text_loops, vision_loops)
         return self.classifier(torch.cat([feature_t, feature_v], dim=-1))
 
+
+class DecoderLoopBlock(nn.Module):
+    """One shared decoder step: self-attention, cross-attention, then an FFN.
+
+    The output projections start at zero, so the residual update is zero and
+    the queries stay unchanged until those projections learn something.
+    """
+
+    def __init__(self, embed_dim: int, num_heads_q: int, num_heads_kv: int, dropout_p: float = 0.1):
+        super().__init__()
+        self.ln_self = nn.LayerNorm(embed_dim)
+        self.self_attn = GQA(embed_dim, num_heads_q, num_heads_kv)
+        self.ln_cross = nn.LayerNorm(embed_dim)
+        self.cross_attn = GQA(embed_dim, num_heads_q, num_heads_kv)
+        self.ln_ffn = nn.LayerNorm(embed_dim)
+        self.ffn = FFN(embed_dim, 4 * embed_dim, dropout_p)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        normed = self.ln_self(query)
+        query = query + self.self_attn(normed, normed, normed)
+        normed = self.ln_cross(query)
+        query = query + self.cross_attn(normed, memory, memory, memory_mask)
+        query = query + self.ffn(self.ln_ffn(query))
+        return query
+
+
+class LoopSkipGate(nn.Module):
+    """Fuse the residuals of every finished loop into the next loop input.
+
+    The score is a zero-initialized linear map, so the weights start uniform.
+    Residuals are zero at initialization, and the next input stays the
+    original CLS queries.
+    """
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(embed_dim, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def fuse(self, original: torch.Tensor, previous: list[torch.Tensor]) -> torch.Tensor:
+        residuals = [state - original for state in previous]
+        scores = torch.cat([self.proj(residual) for residual in residuals], dim=-1)
+        weights = torch.softmax(scores, dim=-1)
+        fused = original.new_zeros(original.shape)
+        for index, residual in enumerate(residuals):
+            fused = fused + weights[..., index:index + 1] * residual
+        return original + fused
+
+
+class DecoderLoop(nn.Module):
+    """One Chinese CLIP pass, then a looped decoder over the full sequences.
+
+    The encoders run once. Text tokens and post-norm vision tokens are
+    projected into the CLIP embedding space and concatenated as memory. The
+    two queries are the projected text CLS and vision CLS. ``num_loops``
+    repeats one decoder block. From the second loop on, the block input is
+    the original queries plus a gated fusion of every earlier loop's residual.
+    At initialization every loop still returns those two CLS vectors.
+    """
+
+    def __init__(
+        self,
+        clip_path: str,
+        num_heads_q: int,
+        num_heads_kv: int,
+        dropout_p: float = 0.1,
+        num_classes: int = 2,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        official = ChineseCLIPModel.from_pretrained(clip_path, trust_remote_code=True)
+        self.text_encoder = official.text_model
+        self.vision_encoder = official.vision_model
+        self.text_projection = official.text_projection
+        self.visual_projection = official.visual_projection
+        self.projection_dim = int(official.projection_dim)
+        del official
+        self.block = DecoderLoopBlock(self.projection_dim, num_heads_q, num_heads_kv, dropout_p)
+        self.skip_gate = LoopSkipGate(self.projection_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.projection_dim * 2, self.projection_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(self.projection_dim, num_classes),
+        )
+        self.processor = AutoProcessor.from_pretrained(clip_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        num_loops: int = 2,
+        token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if num_loops < 1 or num_loops > MAX_LOOPS:
+            raise ValueError(f"num_loops must be in 1..{MAX_LOOPS}, got {num_loops}.")
+        text_hidden = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+        ).last_hidden_state
+        vision_hidden = self.vision_encoder(pixel_values=pixel_values).last_hidden_state
+        vision_hidden = self.vision_encoder.post_layernorm(vision_hidden)
+        text_tokens = self.text_projection(text_hidden)
+        vision_tokens = self.visual_projection(vision_hidden)
+        memory = torch.cat([text_tokens, vision_tokens], dim=1)
+        original = torch.stack([text_tokens[:, 0], vision_tokens[:, 0]], dim=1)
+        memory_mask = self._memory_mask(attention_mask, text_tokens.size(1), vision_tokens.size(1))
+        previous: list[torch.Tensor] = []
+        query = original
+        for _ in range(num_loops):
+            loop_input = original if not previous else self.skip_gate.fuse(original, previous)
+            query = self.block(loop_input, memory, memory_mask)
+            previous.append(query)
+        if len(previous) == 1:
+            query = query + self.skip_gate.proj(query - original).sum() * 0
+        return self.classifier(torch.cat([query[:, 0], query[:, 1]], dim=-1))
+
+    @staticmethod
+    def _memory_mask(attention_mask: torch.Tensor | None, text_len: int, vision_len: int) -> torch.Tensor | None:
+        if attention_mask is None:
+            return None
+        text_keep = attention_mask.to(dtype=torch.bool)
+        if text_keep.size(1) != text_len:
+            raise ValueError(
+                f"Text attention mask length {text_keep.size(1)} does not match {text_len} text tokens."
+            )
+        vision_keep = torch.ones(
+            text_keep.size(0),
+            vision_len,
+            dtype=torch.bool,
+            device=text_keep.device,
+        )
+        keep = torch.cat([text_keep, vision_keep], dim=1)
+        return keep[:, None, None, :]
 
 
 __all__ = [
@@ -664,8 +862,12 @@ __all__ = [
     "Loopback",
     "LoopProbe",
     "PairFuse",
+    "BothLoopFuse",
     "DirectFuse",
     "LoopFuse_partial_loop",
+    "DecoderLoopBlock",
+    "LoopSkipGate",
+    "DecoderLoop",
 ]
 
 
