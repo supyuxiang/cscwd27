@@ -919,7 +919,7 @@ class LoopbackChineseCLIPTextModel_partial_loop(ChineseCLIPTextModel):
         attention_mask: torch.Tensor | None = None,
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        num_loops: int = 3,
+        num_loops: int = 2,
         return_each_loop: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ):
@@ -967,7 +967,7 @@ class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
         self,
         pixel_values: torch.FloatTensor | None = None,
         interpolate_pos_encoding: bool | None = False,
-        num_loops: int = 3,
+        num_loops: int = 2,
         return_each_loop: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ):
