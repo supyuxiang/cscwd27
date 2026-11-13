@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoProcessor, AutoTokenizer, ChineseCLIPModel, ChineseCLIPTextModel, ChineseCLIPVisionModel
 from transformers.masking_utils import create_bidirectional_mask
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+from transformers.modeling_outputs import BaseModelOutput
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
@@ -45,7 +45,7 @@ class LoopedChineseCLIPTextModel(ChineseCLIPTextModel):
         position_ids: torch.Tensor | None = None,
         num_loops: int = 3,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> list[BaseModelOutputWithPooling]:
+    ) -> list[torch.Tensor]:
         if input_ids is None:
             raise ValueError("You have to specify input_ids")
         if num_loops < 1:
@@ -73,19 +73,15 @@ class LoopedChineseCLIPTextModel(ChineseCLIPTextModel):
             last_hidden_state = encoder_outputs.last_hidden_state
             pooled = last_hidden_state[:, 0] # bsz, hidden_size
             weight = self.loop_gate(pooled)
-            hidden_states = (original + weight.exp() * hidden_states) / (1 + weight.exp())
+            hidden_states = (original + weight.exp() * hidden_states) / (1 + weight.exp()) # 和初始embedding的残差连跳
             # The reentry is only consumed by the next loop. On the last step the
             # added term is exactly zero, so the pooled value is unchanged, but the
             # gate and reentry norm stay in the loss graph. One-loop DDP otherwise
             # reports them as unused parameters.
             if step == num_loops - 1:
                 pooled = pooled + (hidden_states - original).sum() * 0
-            outputs.append(
-                BaseModelOutputWithPooling(
-                    last_hidden_state=last_hidden_state,
-                    pooler_output=pooled,
-                )
-            )
+            outputs.append(pooled) 
+        # outputs: num_loops, bsz, hidden_size
         return outputs
 
 
@@ -111,7 +107,7 @@ class LoopedChineseCLIPVisionModel(ChineseCLIPVisionModel):
         interpolate_pos_encoding: bool | None = False,
         num_loops: int = 3,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> list[BaseModelOutputWithPooling]:
+    ) -> list[torch.Tensor]:
         if num_loops < 1:
             raise ValueError(f"num_loops must be positive, got {num_loops}.")
 
@@ -131,12 +127,8 @@ class LoopedChineseCLIPVisionModel(ChineseCLIPVisionModel):
             # reports them as unused parameters.
             if step == num_loops - 1:
                 pooled_output = pooled_output + (hidden_states - original).sum() * 0
-            outputs.append(
-                BaseModelOutputWithPooling(
-                    last_hidden_state=last_hidden_state,
-                    pooler_output=pooled_output,
-                )
-            )
+            outputs.append(pooled_output)
+        # outputs: num_loops, bsz, hidden_size
         return outputs
 
 
@@ -185,27 +177,16 @@ class FFN(nn.Module):
 
 
 def _stack_loop_features(outputs) -> torch.Tensor:
-    if isinstance(outputs, BaseModelOutputWithPooling):
-        features = outputs.pooler_output
-    elif torch.is_tensor(outputs):
-        features = outputs
-    else:
-        pooled = []
-        for item in outputs:
-            if isinstance(item, BaseModelOutputWithPooling):
-                pooled.append(item.pooler_output)
-            elif torch.is_tensor(item):
-                pooled.append(item)
-            else:
-                raise TypeError(f"Unsupported loop feature type: {type(item).__name__}")
-        if not pooled:
-            raise ValueError("Loop feature list is empty.")
-        return torch.stack(pooled, dim=1)
-    if features.dim() == 2:
-        return features.unsqueeze(1)
-    if features.dim() != 3:
-        raise ValueError(f"Pooled loop features must be [batch, dim] or [batch, loops, dim], got {tuple(features.shape)}")
-    return features
+    pooled = []
+    for item in outputs:
+        if torch.is_tensor(item):
+            pooled.append(item)
+        else:
+            raise TypeError(f"Unsupported loop feature type: {type(item).__name__}")
+    if not pooled:
+        raise ValueError("Loop feature list is empty.")
+    return torch.stack(pooled, dim=1)
+    
 
 
 def _encoder_weights(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
@@ -324,16 +305,16 @@ class LoopFuse(nn.Module):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        text_outs = self.text_encoder(
+        text_outs: list[torch.Tensor] = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             num_loops=num_loops,
         )
-        vision_outs = self.vision_encoder(pixel_values=pixel_values, num_loops=num_loops)
-        text_loops = [self.text_projection(out.pooler_output) for out in text_outs]
-        vision_loops = [self.visual_projection(out.pooler_output) for out in vision_outs]
+        vision_outs: list[torch.Tensor] = self.vision_encoder(pixel_values=pixel_values, num_loops=num_loops)
+        text_loops = [self.text_projection(pooled) for pooled in text_outs]
+        vision_loops = [self.visual_projection(pooled) for pooled in vision_outs]
         feature_t_v, feature_v_t = self.fuse(text_loops, vision_loops)
         return self.classifier(torch.cat([feature_t_v, feature_v_t], dim=-1))
 
@@ -467,7 +448,7 @@ def _run_layer_block(
     block = list(layers[start:end])
     suffix = list(layers[end:])
     readouts = []
-    for _ in range(num_loops):
+    for step in range(num_loops):
         for layer in block:
             hidden_states = call(layer, hidden_states)
 
@@ -476,10 +457,16 @@ def _run_layer_block(
             for layer in suffix:
                 decoded = call(layer, decoded)
             readouts.append(decoded)
-            
+
         if gate is not None:
             weight = gate(hidden_states)
             hidden_states = (original + weight.exp() * hidden_states) / (1 + weight.exp())
+            # The mix is only consumed by the next loop. On the last step the
+            # added term is exactly zero, so the readout is unchanged, but the
+            # gate stays in the loss graph. One-loop DDP otherwise reports it
+            # as an unused parameter.
+            if collect_each_loop and step == num_loops - 1:
+                readouts[-1] = readouts[-1] + (hidden_states - original).sum() * 0
 
     if collect_each_loop:
         return readouts
@@ -514,7 +501,7 @@ class LoopbackChineseCLIPTextModel_partial_loop(ChineseCLIPTextModel):
         num_loops: int = 2,
         return_each_loop: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> list[torch.Tensor]:
         if input_ids is None:
             raise ValueError("You have to specify input_ids")
         if num_loops < 1 or num_loops > MAX_LOOPS:
@@ -542,10 +529,7 @@ class LoopbackChineseCLIPTextModel_partial_loop(ChineseCLIPTextModel):
         )
         if return_each_loop:
             return [state[:, 0] for state in hidden_states]
-        return BaseModelOutputWithPooling(
-            last_hidden_state=hidden_states,
-            pooler_output=hidden_states[:, 0],
-        )
+        return [hidden_states[:, 0]]
 
 
 class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
@@ -562,7 +546,7 @@ class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
         num_loops: int = 2,
         return_each_loop: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ):
+    ) -> list[torch.Tensor]:
         if num_loops < 1 or num_loops > MAX_LOOPS:
             raise ValueError(f"num_loops must be in 1..{MAX_LOOPS}, got {num_loops}.")
         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
@@ -578,11 +562,7 @@ class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
         )
         if return_each_loop:
             return [self.post_layernorm(state[:, 0, :]) for state in hidden_states]
-        pooled_output = self.post_layernorm(hidden_states[:, 0, :])
-        return BaseModelOutputWithPooling(
-            last_hidden_state=hidden_states,
-            pooler_output=pooled_output,
-        )
+        return [self.post_layernorm(hidden_states[:, 0, :])]
 
 
 class LoopFuse_partial_loop(nn.Module):
@@ -664,8 +644,8 @@ class LoopFuse_partial_loop(nn.Module):
             num_loops=num_loops,
         )
         vision_out = self.vision_encoder(pixel_values=pixel_values, num_loops=num_loops)
-        text = self.text_projection(text_out.pooler_output)
-        vision = self.visual_projection(vision_out.pooler_output)
+        text = self.text_projection(text_out[-1])
+        vision = self.visual_projection(vision_out[-1])
         feature_t, feature_v = self.fuse(text, vision)
         return self.classifier(torch.cat([feature_t, feature_v], dim=-1))
 
