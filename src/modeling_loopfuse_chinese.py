@@ -1,14 +1,9 @@
 """LoopFuse on Chinese CLIP.
 
-The text tower is Chinese CLIP's BERT encoder. The vision tower is its ViT.
-Both are looped with shared weights, then projected into the Chinese CLIP
-embedding space and fused across loops.
+The text tower is Chinese CLIP's BERT encoder. The vision tower is its ViT. 
+Both are looped with shared weights, then projected into the Chinese CLIP embedding space and fused across loops.
 
-Each later loop keeps the original embedding as its base. A scalar gate,
-initialized at zero, mixes in the normalized previous hidden state. With the
-gate closed, every loop sees the same input as the first pass. The fusion
-head adds a learned loop position, keeps the first-loop feature for the
-classifier, and starts as an identity around attention and the feed-forward.
+
 """
 
 from __future__ import annotations
