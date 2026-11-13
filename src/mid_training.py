@@ -147,8 +147,10 @@ class ImageTextStream(IterableDataset):
                         if not text or not image:
                             continue
                         try:
-                            picture = Image.open(self._resolve(str(image))).convert("RGB")
-                        except (OSError, FileNotFoundError):
+                            picture = Image.open(self._resolve(str(image)))
+                            picture.load()
+                            picture = picture.convert("RGB")
+                        except (OSError, SyntaxError, ValueError):
                             continue
                         yield {"text": text, "image": picture}
 
