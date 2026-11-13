@@ -874,20 +874,24 @@ def _run_layer_block(
     for layer in layers[:start]:
         hidden_states = call(layer, hidden_states)
 
+    original = hidden_states
+
     block = list(layers[start:end])
     suffix = list(layers[end:])
     readouts = []
     for _ in range(num_loops):
         for layer in block:
             hidden_states = call(layer, hidden_states)
-        if gate is not None:
-            weight = gate(hidden_states)
-            hidden_states = (hidden_states + weight.exp() * hidden_states) / (1 + weight.exp())
+
         if collect_each_loop:
             decoded = hidden_states
             for layer in suffix:
                 decoded = call(layer, decoded)
             readouts.append(decoded)
+            
+        if gate is not None:
+            weight = gate(hidden_states)
+            hidden_states = (original + weight.exp() * hidden_states) / (1 + weight.exp())
 
     if collect_each_loop:
         return readouts
