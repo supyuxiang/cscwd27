@@ -39,7 +39,14 @@ if [[ "${LORA_CLIP:-}" == "1" ]]; then
   INIT_ARGS="${INIT_ARGS:+${INIT_ARGS} }+lora_clip=true +lora_rank=${LORA_RANK:-8} +lora_alpha=${LORA_ALPHA:-8}"
 fi
 
-echo "START $(date) split=${SPLIT} seeds=${SEEDS} nproc=${NPROC} host=$(hostname) lr=${LR} min_lr=${MIN_LR} wd=${WD} batch=128 model=${MODEL_TYPE} freeze_clip=${FREEZE_CLIP:-0} lora_clip=${LORA_CLIP:-0} init=${INIT_CKPT:-none}" | tee "$SUMMARY"
+if [[ -n "${LOOP_TEXT:-}" ]]; then
+  INIT_ARGS="${INIT_ARGS:+${INIT_ARGS} }+loop_text=${LOOP_TEXT}"
+fi
+if [[ -n "${LOOP_VISION:-}" ]]; then
+  INIT_ARGS="${INIT_ARGS:+${INIT_ARGS} }+loop_vision=${LOOP_VISION}"
+fi
+
+echo "START $(date) split=${SPLIT} seeds=${SEEDS} nproc=${NPROC} host=$(hostname) lr=${LR} min_lr=${MIN_LR} wd=${WD} batch=128 model=${MODEL_TYPE} freeze_clip=${FREEZE_CLIP:-0} lora_clip=${LORA_CLIP:-0} loop_text=${LOOP_TEXT:-true} loop_vision=${LOOP_VISION:-true} init=${INIT_CKPT:-none}" | tee "$SUMMARY"
 
 run_attempt() {
   local loops="$1" seed="$2" micro="$3" accum="$4" log="$5"

@@ -613,11 +613,11 @@ class LoopbackChineseCLIPVisionModel_partial_loop(ChineseCLIPVisionModel):
 
 
 class LoopFuse_partial_loop(nn.Module):
-    """DirectFuse, except the middle block is repeated as a whole.
+    """Repeat the middle block, then fuse the final text and vision vectors.
 
-    Text applies a zero-initialized per-token gate after each repetition.
-    Both loop readouts are projected and concatenated for BothLoopFuse.
-    ``forced_loops`` keeps this run at 2.
+    ``loop_text`` and ``loop_vision`` choose which tower uses ``num_loops``.
+    A tower that is off runs a single pass. The classifier sees the last
+    readout of each tower.
     """
 
     forced_loops = 2
@@ -665,13 +665,15 @@ class LoopFuse_partial_loop(nn.Module):
             self.text_projection.weight.copy_(state_dict["text_projection.weight"])
             self.visual_projection.weight.copy_(state_dict["visual_projection.weight"])
 
-        self.fuse = BothLoopFuse(self.projection_dim, num_heads_q, num_heads_kv, dropout_p)
+        self.fuse = PairFuse(self.projection_dim, num_heads_q, num_heads_kv, dropout_p)
         self.classifier = nn.Sequential(
             nn.Linear(self.projection_dim * 2, self.projection_dim),
             nn.ReLU(),
             nn.Dropout(dropout_p),
             nn.Linear(self.projection_dim, num_classes),
         )
+        self.loop_text = True
+        self.loop_vision = True
         self.processor = AutoProcessor.from_pretrained(clip_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(clip_path, trust_remote_code=True)
 
@@ -684,22 +686,24 @@ class LoopFuse_partial_loop(nn.Module):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        text_loops = num_loops if self.loop_text else 1
+        vision_loops = num_loops if self.loop_vision else 1
         text_out = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            num_loops=num_loops,
+            num_loops=text_loops,
             return_each_loop=True,
         )
         vision_out = self.vision_encoder(
             pixel_values=pixel_values,
-            num_loops=num_loops,
+            num_loops=vision_loops,
             return_each_loop=True,
         )
-        text_loops = [self.text_projection(pooled) for pooled in text_out]
-        vision_loops = [self.visual_projection(pooled) for pooled in vision_out]
-        feature_t, feature_v = self.fuse(text_loops, vision_loops)
+        text = self.text_projection(text_out[-1])
+        vision = self.visual_projection(vision_out[-1])
+        feature_t, feature_v = self.fuse(text, vision)
         return self.classifier(torch.cat([feature_t, feature_v], dim=-1))
 
 

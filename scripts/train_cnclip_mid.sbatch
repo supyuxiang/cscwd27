@@ -31,7 +31,8 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=4
 export MASTER_PORT=29831
 
-OUT=/data3/yxfeng/experiments/cnclip_midtrain_l2_gate
+OUT=${CNCLIP_MID_OUT:-/data3/yxfeng/experiments/cnclip_midtrain_l2_gate}
+WARMUP_STEPS=${CNCLIP_MID_WARMUP:-2000}
 mkdir -p "$OUT"
 TORCHRUN=/home/yxfeng/miniconda3/envs/www27/bin/torchrun
 DATA=/data3/yxfeng/datasets/cnclip_pretrain/jsonl
@@ -49,7 +50,7 @@ run_train() {
         --data "$DATA" \
         --output "$OUT" \
         --steps "$steps" \
-        --warmup-steps 2000 \
+        --warmup-steps "$WARMUP_STEPS" \
         --lr-warmup 2000 \
         --batch-size "$batch" \
         --lr 5e-6 \

@@ -100,6 +100,8 @@ def build_detector(config: dict):
         from src.modeling_loopfuse_chinese import LoopFuse_partial_loop
 
         model = LoopFuse_partial_loop(**_core_kwargs(config))
+        model.loop_text = _as_bool(config.get("loop_text", True))
+        model.loop_vision = _as_bool(config.get("loop_vision", True))
         if _as_bool(config.get("lora_clip", False)):
             from baselines.lora import LoopLoRABank, attention_linears
 

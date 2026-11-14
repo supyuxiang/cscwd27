@@ -195,7 +195,7 @@ def embed_texts_student(student, processor, texts, batch_size, max_length, devic
     return [torch.cat(parts) for parts in buckets]
 
 
-def recall_retrieval(images: torch.Tensor, texts: torch.Tensor, text_to_image: list[int], image_to_texts: list[list[int]]) -> tuple[str, str]:
+def retrieval_scores(images: torch.Tensor, texts: torch.Tensor, text_to_image: list[int], image_to_texts: list[list[int]]) -> dict[str, float]:
     similarity = images @ texts.T
     image_hits = []
     for image_index, gold_texts in enumerate(image_to_texts):
@@ -208,9 +208,48 @@ def recall_retrieval(images: torch.Tensor, texts: torch.Tensor, text_to_image: l
         text_hits.append((order == image_index).nonzero(as_tuple=False)[0].item())
     image_hits_t = torch.tensor(image_hits)
     text_hits_t = torch.tensor(text_hits)
-    def pack(ranks: torch.Tensor) -> str:
-        return "/".join(f"{float((ranks < k).float().mean()):.3f}" for k in (1, 5, 10))
-    return pack(image_hits_t), pack(text_hits_t)
+
+    def at(ranks: torch.Tensor, prefix: str) -> dict[str, float]:
+        return {f"{prefix}_r{k}": float((ranks < k).float().mean()) for k in (1, 5, 10)}
+
+    return {**at(image_hits_t, "i2t"), **at(text_hits_t, "t2i")}
+
+
+def format_retrieval(scores: dict[str, float]) -> tuple[str, str]:
+    image_to_text = "/".join(f"{scores[f'i2t_r{k}']:.3f}" for k in (1, 5, 10))
+    text_to_image = "/".join(f"{scores[f't2i_r{k}']:.3f}" for k in (1, 5, 10))
+    return image_to_text, text_to_image
+
+
+def recall_retrieval(images: torch.Tensor, texts: torch.Tensor, text_to_image: list[int], image_to_texts: list[list[int]]) -> tuple[str, str]:
+    return format_retrieval(retrieval_scores(images, texts, text_to_image, image_to_texts))
+
+
+def gate_metrics(state: dict) -> dict[str, float]:
+    bias = None
+    absmax = 0.0
+    found = False
+    for name, value in state.items():
+        if "gate" not in name or not torch.is_tensor(value) or value.numel() == 0:
+            continue
+        found = True
+        absmax = max(absmax, float(value.detach().abs().max()))
+        if name.endswith("bias") and value.numel() == 1:
+            bias = float(value.detach().reshape(()))
+    metrics: dict[str, float] = {}
+    if found:
+        metrics["ckpt/gate_absmax"] = absmax
+    if bias is not None:
+        metrics["ckpt/gate_bias"] = bias
+    return metrics
+
+
+def write_metrics(path: Path, step: int, metrics: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"step": step, "metrics": metrics}, ensure_ascii=False, indent=2)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(payload + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def recall_at(similarity: torch.Tensor, ks: tuple[int, ...]) -> dict[str, float]:
@@ -243,6 +282,7 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--num-loops", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--metrics-json", default="", help="Write Flickr and gate metrics for SwanLab.")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -255,27 +295,41 @@ def main() -> None:
         from transformers import ChineseCLIPProcessor
 
         processor = ChineseCLIPProcessor.from_pretrained(args.clip, trust_remote_code=True)
+    metrics: dict[str, float] = {}
     image_v = embed_images_vanilla(vanilla, processor, pictures, args.batch_size, device)
     text_v = embed_texts_vanilla(vanilla, processor, texts, args.batch_size, args.max_length, device)
-    image_to_text, text_to_image_score = recall_retrieval(image_v, text_v, text_to_image, image_to_texts)
+    vanilla_scores = retrieval_scores(image_v, text_v, text_to_image, image_to_texts)
+    image_to_text, text_to_image_score = format_retrieval(vanilla_scores)
     print(f"{'vanilla':16} I2T {image_to_text} T2I {text_to_image_score}", flush=True)
+    metrics.update({f"flickr/vanilla/{key}": value for key, value in vanilla_scores.items()})
     del vanilla
     torch.cuda.empty_cache()
 
     student = LoopStudent(args.clip, num_heads_q=8, num_heads_kv=4, dropout_p=0.0).to(device).eval()
     tag = "vanilla-loop"
+    step = 0
     if not args.skip_checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         student.load_state_dict(checkpoint["model"])
         tag = "midtrain-loop"
-        print(f"checkpoint step {checkpoint.get('step')}", flush=True)
+        step = int(checkpoint.get("step") or 0)
+        gate = gate_metrics(checkpoint["model"])
+        for name, value in gate.items():
+            print(f"{name} {value:.6f}", flush=True)
+        metrics.update(gate)
+        print(f"checkpoint step {step}", flush=True)
     else:
         print("loop towers initialized from Chinese CLIP, no mid-train checkpoint", flush=True)
     image_loops = embed_images_student(student, processor, pictures, args.batch_size, device, args.num_loops)
     text_loops = embed_texts_student(student, processor, texts, args.batch_size, args.max_length, device, args.num_loops)
     for index, (image_s, text_s) in enumerate(zip(image_loops, text_loops)):
-        image_to_text, text_to_image_score = recall_retrieval(image_s, text_s, text_to_image, image_to_texts)
+        loop_scores = retrieval_scores(image_s, text_s, text_to_image, image_to_texts)
+        image_to_text, text_to_image_score = format_retrieval(loop_scores)
         print(f"{tag}{index:<4} I2T {image_to_text} T2I {text_to_image_score}", flush=True)
+        metrics.update({f"flickr/loop{index}/{key}": value for key, value in loop_scores.items()})
+    if args.metrics_json:
+        write_metrics(Path(args.metrics_json), step, metrics)
+        print(f"metrics {args.metrics_json} step {step}", flush=True)
 
 
 if __name__ == "__main__":
